@@ -84,9 +84,15 @@ Critical/Warning cites `file:line` — behavior is never inferred from a name.
 
 Output format (concise structured summary, not full file contents):
 1. First line, exactly: `VERDICT: Critical=N | Warning=N | Suggestion=N` — append ` (CLEAN)` when
-   Critical=0 and Warning=0. **Counts are defects REMAINING after your pass** (fixed-and-verified
-   items are NOT counted — they belong in Findings/Changes marked FIXED). A pass that confirms and
-   fixes six findings and leaves none open reports `Critical=0 | Warning=0 | Suggestion=0 (CLEAN)`,
+   Critical=0 and Warning=0. **The line starts with the word `VERDICT` and nothing else** — no `##`
+   heading prefix, no bold, no bullet, and **no preamble sentence before it**, however short. The
+   loop gates on this line by reading it literally, and anything in front of it breaks that parse
+   silently. (Measured 2026-08-17: two live runs in this suite broke it — `sqa-efficiency`'s first
+   run emitted `## VERDICT: …`, and an `sqa-lead` run emitted a preamble sentence ahead of the line.
+   The wording *"First line, exactly"* alone was not enough to prevent either.)
+   **Counts are defects REMAINING after your pass** (fixed-and-verified items are NOT counted —
+   they belong in Findings/Changes marked FIXED). A pass that confirms and fixes six findings and
+   leaves none open reports `Critical=0 | Warning=0 | Suggestion=0 (CLEAN)`,
    never the intake counts — the verdict line is a state-of-the-code header, not a work log, and
    restating intake counts reads as fresh regressions to whoever gates on it.
 2. **Breakdown** — what the code does, 2–5 sentences.

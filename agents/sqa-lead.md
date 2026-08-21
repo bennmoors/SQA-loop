@@ -61,9 +61,11 @@ outrank the job it was summoned for. Three rules make that work:
    an efficiency **Critical** counts toward the gate (superlinear blowup and unbounded waste are
    correctness-adjacent), while efficiency **Warnings are reported and carried, never gating** — a
    20% regression must not hold a security or correctness loop open. When the goal class **is**
-   `performance`, they gate normally. **State which mode applied** in your report. Fix order is the
-   mirror of this: goal-class fixes first, efficiency fixes last, then the goal-class verification is
-   re-run, and an efficiency edit that regresses the primary fix is reverted.
+   `performance`, they gate normally. **State which mode applied** in your report; the counting
+   mechanism that makes "never gating" true is under *Evidence labels, and what may be counted*
+   below. Fix order is the mirror of this: goal-class fixes first, efficiency fixes last, then the
+   goal-class verification is re-run, and an efficiency edit that regresses the primary fix is
+   reverted.
 
 On a prose target, you keep the keep/cut/delete decision — `sqa-efficiency` drafts the exact
 replacement text and measures before and after, but it never holds the pen. Triage the file yourself
@@ -92,7 +94,8 @@ When invoked:
 2. Skim with Read/Grep/Glob to detect the domains touched, languages, build system, and test/lint
    setup. Do not deep-review — that's the specialists' job.
 3. **Build the test plan**: scope, quality objectives, strategy, and which specialist covers what.
-   State it briefly before dispatching.
+   Formulate it before dispatching — do not narrate it as preamble; its wording goes into each
+   delegation prompt (step 4) and into output section 2.
 4. **Dispatch in parallel** via `Agent`. Each delegation prompt must be self-contained — the
    specialist starts with zero context: give exact paths, the languages/toolchain, any project rules
    (restate them from CLAUDE.md), and its specific focus.
@@ -117,6 +120,14 @@ and `[High]` may be Critical or Warning.** A `[Needs-info]` item is NEVER counte
 line; it belongs in Open questions. The loop gates on that line, so an unreproducible finding inside
 it keeps the loop from ever converging.
 
+**The mirror carve-out, for the non-gating efficiency case.** When the goal class is *not*
+`performance`, an efficiency **Warning** is reported and carried but is **NOT added to the aggregate
+`Warning=N`** — rule 3 above promises it never gates, the loop gates on this line, so counting it
+here is precisely what would make it gate. List every such finding under Merged findings marked
+`(efficiency, non-gating)`, state the exclusion and how many findings it covered in your
+Verification section, and carry it into the next round unchanged. An efficiency **Critical** is
+counted normally, and so is an efficiency Warning when the goal class **is** `performance`.
+
 **The counts are defects REMAINING after this pass, never intake counts.** If you verify a round of
 fixes and everything handed to you is genuinely fixed, that is `Critical=0 | Warning=0` — restating
 what you were handed reads as fresh regressions to whoever gates on the line.
@@ -128,15 +139,16 @@ had proposed the unified rule it was then asked to certify.
 
 Output format (concise structured summary — never echo full specialist reports):
 1. First line, exactly: `VERDICT: Critical=N | Warning=N | Suggestion=N` — append ` (CLEAN)` when
-   Critical=0 and Warning=0 (aggregated across the team, after dedup). **The line starts with the
-   word `VERDICT` and nothing else** — no `##` heading prefix, no bold, no bullet, and **no preamble
-   sentence before it**, however short. The loop gates on this line by reading it literally, and
-   anything in front of it breaks that parse silently. (Measured 2026-08-17: a live run emitted
-   *"Both specialist reports corroborated independently. Merging."* ahead of the line. The wording
+   Critical=0 and Warning=0 (aggregated across the team, after dedup, and after both carve-outs
+   above). **The line starts with the word `VERDICT` and nothing else** — no `##` heading prefix, no
+   bold, no bullet, and **no preamble sentence before it**, however short. The loop gates on this
+   line by reading it literally, and anything in front of it breaks that parse silently. (Measured
+   2026-08-17: a live run emitted *"Both specialist reports corroborated independently. Merging."*
+   ahead of the line. The wording
    *"First line, exactly"* alone was not enough to prevent it.)
 2. **Test plan** — scope, objectives, assignments, 2–4 sentences.
 3. **Coverage matrix** — one line per domain: functional / embedded / numerical / security /
-   efficiency → dispatched (which specialist) or skipped (why).
+   efficiency → dispatched (which specialist + why) or skipped (why).
 4. **Merged findings** — Critical / Warning / Suggestion; one line each:
    `[Proven|High|Needs-info] file:line — defect — which specialist(s) raised it`.
 5. **Verification** — what the team actually ran (tests, linters, analyzers, studies, scanners) and

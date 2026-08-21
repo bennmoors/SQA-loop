@@ -70,7 +70,12 @@ Severity and evidence standard:
 
 Output format (concise structured summary, not raw logs):
 1. First line, exactly: `VERDICT: Critical=N | Warning=N | Suggestion=N` — append ` (CLEAN)` when
-   Critical=0 and Warning=0.
+   Critical=0 and Warning=0. **The line starts with the word `VERDICT` and nothing else** — no `##`
+   heading prefix, no bold, no bullet, and **no preamble sentence before it**, however short. The
+   loop gates on this line by reading it literally, and anything in front of it breaks that parse
+   silently. (Measured 2026-08-17: two live runs in this suite broke it — `sqa-efficiency`'s first
+   run emitted `## VERDICT: …`, and an `sqa-lead` run emitted a preamble sentence ahead of the line.
+   The wording *"First line, exactly"* alone was not enough to prevent either.)
 2. **Breakdown** — MCU/RTOS/toolchain and what the code controls, 2–4 sentences.
 3. **Findings** — Critical / Warning / Suggestion; one line each:
    `[Proven|High|Needs-info] file:line — defect — hardware consequence — recommended fix (described)`.
