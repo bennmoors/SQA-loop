@@ -164,7 +164,7 @@ None are required. One interacts with this suite and needs configuring if you ha
 
 ### `ponytail` — configure it, or it will corrupt your reports
 
-[ponytail](https://github.com/DietrichGebert) injects a "lazy senior dev" instruction set into
+[ponytail](https://github.com/DietrichGebert/ponytail) injects a "lazy senior dev" instruction set into
 agents. Its output rule — *"code first, then at most three short lines"* — **directly contradicts**
 this suite's mandated `VERDICT:` line, evidence labels and coverage matrix, and
 `qa-harness/agent_invariants.py` byte-diffs that format. Unscoped, it also costs roughly 5× the

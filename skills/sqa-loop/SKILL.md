@@ -1,6 +1,6 @@
 ---
 name: sqa-loop
-description: Run a full software-quality assurance loop on a target — route the goal, dispatch the SQA specialist agents, hand findings to the fixer, verify with a fresh reviewer, and optionally hill-climb a metric inside that envelope. Use when asked to test, QA, verify, validate, review or harden something, e.g. "SQA this", "QA loop on src/", "run an SQA autoresearch loop that ensures security in my API", "make sure this is correct and tight". Not for a quick one-off read of a file.
+description: Use when asked to test, QA, verify, validate, review or harden something, e.g. "SQA this", "QA loop on src/", "run an SQA autoresearch loop that ensures security in my API", "make sure this is correct and tight" — runs a full software-quality assurance loop on a target: routes the goal, dispatches the SQA specialist agents, hands findings to the fixer, verifies with a fresh reviewer, and optionally hill-climbs a metric inside that envelope. Not for a quick one-off read of a file.
 ---
 
 # The SQA loop

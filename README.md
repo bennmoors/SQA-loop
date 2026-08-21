@@ -156,7 +156,7 @@ For the full loop — routing, rounds, anti-gaming, ledger discipline:
 
 The `/sqa-loop` skill is installed for you. If you would rather have the protocol always-on instead
 of invoked, paste [docs/QA-LOOP-PROTOCOL.md](docs/QA-LOOP-PROTOCOL.md) into your `~/.claude/CLAUDE.md`
-— it costs about 20 KB of context in every session, which is why the skill is the default.
+— it costs about 11 KB of context in every session, which is why the skill is the default.
 
 ## Platform support
 

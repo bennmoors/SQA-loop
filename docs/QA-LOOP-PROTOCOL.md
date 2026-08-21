@@ -5,7 +5,7 @@ You have two ways to get the QA loop. This page is about the second one.
 | | `/sqa-loop` skill | pasted into `CLAUDE.md` |
 |---|---|---|
 | Loads | on invocation | every session, always |
-| Context cost | only when used | ~20 KB, permanently |
+| Context cost | only when used | ~11 KB, permanently |
 | Triggered by | `/sqa-loop <target>`, or a matching request | any request that sounds like QA |
 | Installed by | `install.ps1` | you, by hand |
 
