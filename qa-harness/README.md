@@ -108,7 +108,7 @@ the wiring is re-read from the live agent file each run. `file` calls the script
 (measures a configuration that does not exist in production), `fixed` is the exit-code-propagating
 form, and `broken` is the old inert form, kept so the silent-allow regression stays demonstrable.
 
-Reference scores, 2026-08-24: `guard_corpus` **107/107 (100.0%)** · `scope_corpus` **47/51 (92.2%)**
+Reference scores, 2026-08-24: `guard_corpus` **153/153 (100.0%)** · `scope_corpus` **47/51 (92.2%)**
 with four known upstream bypasses — see `docs/GUARDS.md`.
 
 ### `_wiring.py`, and the two defects that created it

@@ -94,6 +94,62 @@ behind the allowlist inspects the payload for writes, metaprogramming (`__import
 Redirects are contained: only `/dev/null`, `NUL`, `$null`, or a path with a `temp`/`tmp` segment —
 and a `..` anywhere in the target disqualifies it, because `/tmp/../SKILL.md` was a measured bypass.
 
+### Shell and PowerShell review (added 2026-08-24)
+
+**Tier 1 — static analysis, non-mutating.** `shellcheck` (already present), `shfmt` in read-only
+modes, and `bash -n`/`sh -n`. Write modes are refused at **flag** level, not binary level: `shfmt`
+joins the existing linter row whose lookahead already excludes `-w`/`--write`, and `-n` is matched
+positionally because it is the entire difference between parsing a script and running it.
+
+`Invoke-ScriptAnalyzer` is reachable under a **closed parameter grammar** — permitted parameters are
+allowlisted *positively*, values may not contain `( ) $ { } \` ; | & < >`, and `-CustomRulePath` is
+pinned to the installed InjectionHunter. Three measurements forced that shape:
+
+- **`-F` and `-Fi` both bind to `-Fix`.** PowerShell binds any unambiguous prefix, so a regex
+  denying the literal string `-Fix` is bypassed by typing one fewer character. Positive
+  allowlisting is the only flag-level match that holds for a cmdlet.
+- **`-CustomRulePath` is arbitrary code execution.** Importing a module runs its top-level code,
+  the parameter takes any caller path, and agents can already write into temp. The pinned directory
+  is not writable without admin.
+- **Nothing sits behind this row.** The denylist's payload rules are Python/Node only — measured,
+  `Start-Process`, `Invoke-Expression`, `iex`, `Import-Module` and `New-Object` all pass inside an
+  already-allowed form — and it cannot see inside quotes at command position at all. So the grammar
+  must refuse metacharacters itself.
+
+The routine path is not that row: `tools/lint_probe.py` invokes PSSA internally against a
+module-constant script, so an ordinary review never needs `-Command`.
+
+**Tier 2 — code-executing runners, sandbox-only.** `bats` and `Invoke-Pester` run the target's own
+code, so they are constrained by *where* the target is: a path inside a temp directory with no
+`..`. The live repo and the installed `~/.claude` copy are unreachable by construction. `cp` returns
+to the allowlist for exactly one shape — copying *into* temp, with the destination anchored as the
+**final token**, because `cp /tmp/evil.psm1 hooks/guard.ps1` has its source in temp and its
+destination on the guard.
+
+> **A temp sandbox bounds what the tests modify; it does not sandbox the code.** A `.bats` or Pester
+> file staged into temp still runs with the user's full privileges. This is the same accepted risk
+> `pytest` and `python foo.py` already carry, in new syntax rather than a new class.
+
+`hyperfine` is allowlisted under a closed grammar, not as `hyperfine\b.*`. Its argument *is a
+command it runs*, so the naive row is a full guard bypass — `hyperfine 'rm -rf build/'`,
+`--prepare`, `--setup` and `-S none 'curl … | sh'` all execute, and the denylist cannot see into the
+quotes. The grammar requires the payload to be an interpreter plus a metacharacter-free path.
+Nothing in a regex can verify the user *asked* for a benchmark; that half stays advisory.
+
+### Searcher-quote masking
+
+The tokeniser builds a **masked** copy of the command in which the quoted arguments of a read-only
+searcher (`grep`, `rg`, `findstr`, `Select-String`, …) are blanked. The redirect and denylist scans
+read the masked copy; the allowlist still matches the real text. This fixes three measured false
+positives — `grep -rn "echo x > out.txt" …`, `grep -rn "| Set-Content" …`, `grep -rn "rm -rf build/" …`
+— which are a reviewer's daily work and about to become constant now that the suite reviews
+PowerShell.
+
+It cannot weaken the guard: masking applies only *inside quotes* and only when the segment head is a
+searcher. A real `cat x | Set-Content y` is split at the unquoted `|`, so its second segment's head
+is `Set-Content`, which no allowlist row admits — it dies at the allowlist before the denylist is
+consulted. An unquoted payload is untouched, and a quoted one is not a command.
+
 Regex evaluation is capped at 2 s and **fails CLOSED** on timeout: a command that cannot be checked
 in bounded time is not allowed through. It fails **open** on a stdin parse error, deliberately — a
 bug in the guard must never wedge a legitimate run.
@@ -101,10 +157,12 @@ bug in the guard must never wedge a legitimate run.
 ### Corpus status
 
 ```
-must-block: 70/70     must-allow: 37/37     107/107 = 100.0%
+must-block: 98/98     must-allow: 55/55     153/153 = 100.0%
 ```
 
-Measured 2026-08-21 via `--invocation frontmatter`, i.e. through the same wiring production uses.
+Measured 2026-08-24 via `--invocation frontmatter`, i.e. through the same wiring production uses.
+Was 107/107 before the shell and PowerShell rows; the 46 new cases are two-sided by construction —
+every row that widens what the suite can run has a must-block mate naming the attack it refuses.
 
 ---
 

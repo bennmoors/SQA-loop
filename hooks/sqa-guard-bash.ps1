@@ -67,15 +67,67 @@ function Deny([string]$why) {
 # ------------------------------------------------------------------ tokenise into segments
 # Quote-aware: separators inside quotes are literal. `grep -rn 'a; b' .` is ONE segment, and
 # treating that semicolon as a separator would refuse a legitimate search.
+#
+# SEARCHER-QUOTE MASKING, added 2026-08-24, built in the SAME pass so nothing is re-derived.
+# Alongside the real segments this builds a MASKED copy in which the quoted arguments of a
+# read-only searcher are blanked to spaces. The masked copy is what the redirect and denylist
+# scans read; the allowlist still matches the REAL text.
+#
+# The defect it fixes was measured against the live guard:
+#     grep -rn "echo x > out.txt" deploy.sh    -> BLOCK   (redirect scan hit the search STRING)
+#     grep -rn "| Set-Content" scripts/        -> BLOCK   (denylist hit inside the search STRING)
+#     grep -rn "Set-Content" scripts/          -> ALLOW   (bare name was already fine)
+# Searching for the text of a dangerous command is the daily work of a code reviewer, and this
+# suite now makes PowerShell review routine, so that traffic is about to become constant.
+# guard_corpus.py:22 already states the motive; blocking it is what teaches agents to route around
+# the guard.
+#
+# WHY THIS CANNOT WEAKEN THE GUARD. Masking applies only INSIDE quotes, and only in a segment
+# whose HEAD is a read-only searcher. A real `cat x | Set-Content y` is split at the unquoted `|`
+# by this very loop, so its second segment's head is `Set-Content`, which no allowlist row admits
+# -- it dies at the allowlist, before the denylist is consulted at all. Masking a quoted span
+# therefore removes text that could only ever have been a false positive: an unquoted payload is
+# untouched, and a quoted one is not a command.
 $segments = New-Object System.Collections.ArrayList
+$maskedSegments = New-Object System.Collections.ArrayList
+$maskedAll = New-Object System.Text.StringBuilder
 $buf = New-Object System.Text.StringBuilder
+$mbuf = New-Object System.Text.StringBuilder
 $sq = $false; $dq = $false
+$segIsSearcher = $false
+$SEARCHER_HEAD = '^\s*(?:grep|egrep|fgrep|rg|ag|ack|findstr|Select-String)\b'
+
+# Append to the real buffer and to the masked buffer, blanking the char when it sits inside a
+# searcher's quoted argument.
+function Add-Char([char]$c, [bool]$masked) {
+    [void]$buf.Append($c)
+    if ($masked) { [void]$mbuf.Append(' '); [void]$maskedAll.Append(' ') }
+    else         { [void]$mbuf.Append($c);  [void]$maskedAll.Append($c) }
+}
+function Close-Segment([char]$sep) {
+    [void]$segments.Add($buf.ToString())
+    [void]$maskedSegments.Add($mbuf.ToString())
+    $buf.Clear() | Out-Null; $mbuf.Clear() | Out-Null
+    if ($sep -ne [char]0) { [void]$maskedAll.Append($sep) }
+}
+
 for ($i = 0; $i -lt $cmd.Length; $i++) {
     $ch = $cmd[$i]
     $next = if ($i + 1 -lt $cmd.Length) { $cmd[$i + 1] } else { [char]0 }
 
-    if ($ch -eq "'" -and -not $dq) { $sq = -not $sq; [void]$buf.Append($ch); continue }
-    if ($ch -eq '"' -and -not $sq) { $dq = -not $dq; [void]$buf.Append($ch); continue }
+    # Decide searcher-ness at the moment a quote OPENS, using the segment text seen so far. The
+    # head always precedes the first quote in any real invocation (`grep -rn "..."`).
+    if (($ch -eq "'" -and -not $dq) -or ($ch -eq '"' -and -not $sq)) {
+        if (-not $sq -and -not $dq) {
+            $segIsSearcher = ($buf.ToString() -match $SEARCHER_HEAD)
+        }
+    }
+
+    if ($ch -eq "'" -and -not $dq) { $sq = -not $sq; Add-Char $ch $false; continue }
+    if ($ch -eq '"' -and -not $sq) { $dq = -not $dq; Add-Char $ch $false; continue }
+
+    # Inside a searcher's quoted argument: blank it in the masked copy only.
+    if (($sq -or $dq) -and $segIsSearcher) { Add-Char $ch $true; continue }
 
     if (-not $sq -and -not $dq) {
         # Command substitution: refused outright (rule 3).
@@ -87,23 +139,25 @@ for ($i = 0; $i -lt $cmd.Length; $i++) {
             while ($i -lt $cmd.Length -and $cmd[$i] -ne "`n") { $i++ }
             continue
         }
+        # Every separator below ALSO ends the searcher context: the next segment gets its own head.
         if ($ch -eq ';' -or $ch -eq "`n" -or $ch -eq "`r") {
-            [void]$segments.Add($buf.ToString()); $buf.Clear() | Out-Null; continue
+            Close-Segment $ch; $segIsSearcher = $false; continue
         }
         if (($ch -eq '&' -and $next -eq '&') -or ($ch -eq '|' -and $next -eq '|')) {
-            [void]$segments.Add($buf.ToString()); $buf.Clear() | Out-Null; $i++; continue
+            Close-Segment $ch; [void]$maskedAll.Append($next); $segIsSearcher = $false; $i++; continue
         }
         if ($ch -eq '|') {
-            [void]$segments.Add($buf.ToString()); $buf.Clear() | Out-Null; continue
+            Close-Segment $ch; $segIsSearcher = $false; continue
         }
         # A single trailing `&` backgrounds the command; treat as a separator too.
         if ($ch -eq '&') {
-            [void]$segments.Add($buf.ToString()); $buf.Clear() | Out-Null; continue
+            Close-Segment $ch; $segIsSearcher = $false; continue
         }
     }
-    [void]$buf.Append($ch)
+    Add-Char $ch $false
 }
-[void]$segments.Add($buf.ToString())
+Close-Segment ([char]0)
+$maskedCmd = $maskedAll.ToString()
 
 # ------------------------------------------------------------------ allowlisted command forms
 # Anchored and matched against the WHOLE segment. Each entry is `^\s*<form>\s*$`.
@@ -112,6 +166,29 @@ for ($i = 0; $i -lt $cmd.Length; $i++) {
 # allowed because it is how a repo is addressed, but it CANNOT smuggle a write: the subcommand
 # that follows still has to be one of these names, so `git -C repo commit` is refused by
 # omission rather than by a pattern that has to anticipate it.
+# ------------------------------------------------------------------ TIER 2 SANDBOX FRAGMENT
+# A path INSIDE a temp directory. Tier 2 tools (bats, Invoke-Pester) execute the target's own
+# code, so the operating policy is that they never touch the live repo or the installed
+# ~/.claude copy -- only a disposable per-session copy staged into temp. This fragment is how
+# that is enforced in the guard rather than merely instructed in an agent body.
+#
+# It matches the same directory shape as $tempOk below (a `temp`/`tmp` path segment), but is NOT
+# anchored to the whole token, because here it is one argument among several. It also covers the
+# WSL spelling `/mnt/c/Users/.../AppData/Local/Temp/...`, which is how bats sees a staged copy.
+#
+# `..` IS HANDLED SEPARATELY, by a `(?!.*\.\.)` lookahead on each Tier 2 row. Prefix matching on
+# an un-normalised path is not a containment check -- `/tmp/../hooks/guard.ps1` starts with an
+# approved prefix and lands in the repo. That was a measured bypass against the redirect rule and
+# it would be the same bypass here.
+$tempArg = '(?:[A-Za-z]:)?[\\/]?(?:[^\s;|&]*[\\/])?(?:temp|tmp)[\\/][^\s;|&]*'
+
+# The PARAMETERS Invoke-ScriptAnalyzer may receive. A POSITIVE allowlist, and it has to be:
+# PowerShell binds any unambiguous parameter PREFIX, so `-F`, `-Fi` and `-Fix` all reach -Fix
+# (measured 2026-08-24; `-Zzz` is rejected, so the probe discriminates). A negative match on the
+# literal string `-Fix` is defeated by typing one fewer character. Anything starting with `-`
+# that is not on this list is refused.
+$psaParam = '-(?:Path|Settings|IncludeRule|ExcludeRule|Severity|Recurse|ReportSummary|IncludeDefaultRules|EnableExit)\b'
+
 $gitOpts = '(?:-C\s+\S+\s+|-c\s+[\w.]+=\S+\s+|--git-dir=\S+\s+|--work-tree=\S+\s+|--no-pager\s+)*'
 $gitRead = 'status|diff|log|show|blame|describe|rev-parse|rev-list|ls-files|ls-tree|cat-file|shortlog|whatchanged|diff-tree|merge-base|symbolic-ref|count-objects|verify-pack|check-ignore|grep|for-each-ref'
 
@@ -167,7 +244,28 @@ $allowed = @(
     # Running a .py file by path -- how the QA harness metrics and checkers are invoked.
     '(?:python3?|py)\s+(?:-[A-Za-z]+\s+)*\S+\.py(?:\s+.*)?',
     # Linters and type checkers, all read-only in their default form.
-    '(?:ruff|mypy|flake8|pylint|black|isort|eslint|tsc|shellcheck)\b(?!.*(?:--fix|--write|-w\b|--in-place)).*',
+    #
+    # `shfmt` joins this row rather than getting its own, because the existing lookahead is already
+    # exactly the flag-level rejection it needs: `-w` and `--write` are its only write modes.
+    # Verified 2026-08-24 that shfmt REJECTS combined short flags itself (`shfmt -lw x.sh` ->
+    # "flag provided but not defined: -lw"), so there is no `-lw` hole behind the `-w\b` boundary
+    # -- two independent reasons, which is what this row needed before it could carry a formatter.
+    # Read-only modes are `-d` (diff), `-l` (list) and bare stdout.
+    # Known false positive, stated rather than discovered later: a FILENAME containing `-w`
+    # (`shfmt -d my-w.sh`) is refused. Annoying; safe direction.
+    '(?:ruff|mypy|flake8|pylint|black|isort|eslint|tsc|shellcheck|shfmt)\b(?!.*(?:--fix|--write|-w\b|--in-place)).*',
+
+    # --- SHELL SYNTAX CHECK, Tier 1. `-n` is MANDATORY and the target must look like a script.
+    # Without `-n` this is `bash <script>`, i.e. arbitrary execution; the flag is the entire
+    # difference between a parse and a run, so it is matched positionally rather than by lookahead.
+    # `bash -c` is NOT reachable here: `-c` is not `-n`, and there is no bare `bash` row.
+    #
+    # WORTH KNOWING WHAT THIS DOES NOT DO. `sh -n` is not a dialect check -- measured 2026-08-24,
+    # it exits 0 on a `#!/bin/sh` script using `[[ ]]` and `local`, where `shellcheck -s sh`
+    # returns SC3010 and SC3043. It is here because it catches genuine syntax errors with zero
+    # setup and is the shell analogue of the mutant compile-check code-reviewer must run. Dialect
+    # is shellcheck's job, through lint_probe.
+    '(?:bash|sh)\s+-n\s+\S+\.(?:sh|bash|bats|ksh)\s*',
 
     # --- SECURITY AND STATIC-ANALYSIS SCANNERS, read-only forms only.
     #
@@ -199,6 +297,68 @@ $allowed = @(
     # sqa-numerical and sqa-functional both instruct agents to write scratch drivers, so
     # refusing these outright would push work around the guard, which is worse than the risk.
     '(?:python3?|py|node|deno|bun|perl|ruby|php)\s+.*-(?:c|e|-eval)\b.*',
+
+    # ------------------------------------------------------ TIER 2: CODE-EXECUTING TEST RUNNERS
+    #
+    # These RUN the target's own code, so unlike everything above they are constrained by WHERE
+    # the target is, not only by how the command is spelled. Every one requires a path inside a
+    # temp directory with no `..`, which is the disposable per-session sandbox the operating
+    # policy mandates. The live repo and the installed ~/.claude copy are unreachable by
+    # construction rather than by instruction.
+    #
+    # BE HONEST ABOUT WHAT THIS DOES AND DOES NOT BUY. A temp sandbox bounds what the TESTS
+    # modify; it does not sandbox the code. A .bats or Pester file staged into temp still runs
+    # with the user's full privileges. The containment is over blast radius on the artifacts this
+    # suite protects, not over capability -- and that is the same accepted risk `pytest` and
+    # `python foo.py` already carry two screens above, in new syntax rather than a new class.
+    ("(?!.*\.\.)(?:wsl\s+(?:--\s+)?)?bats\b(?!.*(?:--output|--report-formatter|\s-o\b))(?:\s+--?[\w-]+(?:\s+\d+)?)*\s+" + $tempArg + '\s*'),
+    ("(?!.*\.\.)(?:powershell|pwsh)(?:\.exe)?\s+-NoProfile\s+-NonInteractive\s+-Command\s+Invoke-Pester(?:\s+-(?:Path|Output|CI|Detailed)\b)*\s+(?:-Path\s+)?" + $tempArg + '\s*'),
+
+    # --- STATIC ANALYSIS, Tier 1: Invoke-ScriptAnalyzer under a CLOSED PARAMETER GRAMMAR.
+    #
+    # This is the one row that admits PowerShell directly, and it carries the whole burden alone:
+    # measured 2026-08-24, the denylist behind this allowlist has ZERO PowerShell payload rules
+    # (`Start-Process`, `Invoke-Expression`, `iex`, `Import-Module`, `New-Object` all pass inside
+    # an already-allowed form) and cannot see inside quotes at command position at all. So the
+    # grammar itself must refuse metacharacters; there is no second line of defence.
+    #
+    # Three constraints, each measured rather than assumed:
+    #   1. PARAMETERS ARE POSITIVELY ALLOWLISTED ($psaParam). Denying the literal `-Fix` does not
+    #      work -- `-F` and `-Fi` both bind to it.
+    #   2. -CustomRulePath IS PINNED to the installed InjectionHunter. Importing a module EXECUTES
+    #      its top-level code, the parameter takes any caller path, and agents can already write
+    #      into temp -- so an unpinned value is arbitrary code execution with the write
+    #      precondition already met. That directory is not writable without admin (verified).
+    #   3. VALUES MAY NOT CONTAIN ( ) $ { } ` ; | & < > -- no subexpressions, no substitution.
+    # Tested against 12 allow/block cases including -F, -Fi, -CustomRulePath /tmp/evil.psm1,
+    # `-Path (Start-Process calc)` and `-Path $(whoami)`.
+    #
+    # Note the routine path is NOT this row: lint_probe.py invokes PSSA internally against a
+    # module-constant script, so an ordinary review never needs `-Command` at all. This exists for
+    # a direct ad-hoc query, and is deliberately the narrower of the two doors.
+    ('(?:powershell|pwsh)(?:\.exe)?\s+-NoProfile\s+-NonInteractive\s+-Command\s+Invoke-ScriptAnalyzer' +
+     '(?:\s+(?:-CustomRulePath\s+"?''?C:[\\/]Program Files[\\/]WindowsPowerShell[\\/]Modules[\\/]InjectionHunter[\\/][\d.]+[\\/]InjectionHunter\.psd1''?"?' +
+     '|' + $psaParam +
+     '|(?![-])(?:"[^"$`(){};|&<>]*"|[^\s"''$`(){};|&<>]+)))*\s*'),
+
+    # --- THE SUITE'S OWN PROBE SCRIPT, by exact path. Proposed separately from the target rule
+    # above on purpose: this runs a script the SUITE ships, never a review target. The path is
+    # pinned to `.claude/tools/ps_lint.ps1`, which fixer-scope-guard.ps1 protects from the fixer,
+    # so it cannot be swapped for a script under review. Ordinary use goes through
+    # `python .../lint_probe.py`, which already spawns this internally; the row exists so an agent
+    # can invoke the backend directly when explaining a refusal.
+    '(?!.*\.\.)(?:powershell|pwsh)(?:\.exe)?\s+-NoProfile\s+-NonInteractive\s+(?:-ExecutionPolicy\s+Bypass\s+)?-File\s+[^\s;|&]*[\\/]\.claude[\\/]tools[\\/]ps_lint\.ps1(?:\s+[^\s;|&]+)*\s*',
+
+    # --- HYPERFINE, under a closed grammar. See the long note at the foot of this file.
+    ('(?!.*\.\.)hyperfine(?:\s+(?:(?:-w|--warmup|-m|--min-runs|-M|--max-runs|-r|--runs|-N|--style)\s+\S+|-i|--ignore-failure))*' +
+     '(?:\s+''(?:bash|sh|pwsh|powershell|python3?)\s+[^''"$`(){};|&<>*?]+''){1,2}\s*'),
+
+    # --- SANDBOX STAGING. `cp` returns to the allowlist for exactly one shape: copying INTO a
+    # temp directory, which is how a Tier 2 sandbox gets built. The destination must be the FINAL
+    # token and must be a temp path; the matching denylist rule below is rewritten to fire on any
+    # other `cp`. The case that makes this non-obvious is `cp /tmp/evil.psm1 hooks/guard.ps1` --
+    # SOURCE in temp, destination in the repo -- which a naive "mentions temp" check would allow.
+    ("(?!.*\.\.)cp\s+(?:-[rRpa]+\s+)*[^\s;|&-][^\s;|&]*\s+" + $tempArg + '\s*'),
 
     # --- PowerShell read-only cmdlets
     '(?:Get-Content|Select-String|Get-ChildItem|Get-Item|Test-Path|Measure-Object|Get-Command|Get-Help|Compare-Object|ConvertFrom-Json|Select-Object|Where-Object|ForEach-Object|Sort-Object|Format-List|Format-Table|Out-String|Write-Output|Write-Host)\b.*'
@@ -233,11 +393,16 @@ $redirectRe = '(?<![<>])[0-9]?>{1,2}\s*(?!&)(?<target>[^\s;|&]+)|>\|\s*(?<target
 # matching on an un-normalised path is not a containment check.
 $tempOk = '^(?:/dev/null|NUL|nul|\$null)$|^(?:[A-Za-z]:)?[\\/]?(?:.*[\\/])?(?:temp|tmp|Temp|TEMP)[\\/]'
 
-foreach ($seg in $segments) {
+for ($k = 0; $k -lt $segments.Count; $k++) {
+    $seg = $segments[$k]
     if ([string]::IsNullOrWhiteSpace($seg)) { continue }
     $s = $seg.Trim()
+    # The redirect and here-doc scans read the MASKED segment, so a `>` inside a search PATTERN is
+    # not mistaken for a redirection. The allowlist below still matches the REAL text -- masking
+    # must never be able to make an unrecognised command look recognisable.
+    $sMask = ([string]$maskedSegments[$k]).Trim()
 
-    foreach ($m in [regex]::Matches($s, $redirectRe)) {
+    foreach ($m in [regex]::Matches($sMask, $redirectRe)) {
         $t = $m.Groups['target'].Value
         if (-not $t) { $t = $m.Groups['target2'].Value }
         if ($t -and (($t -notmatch $tempOk) -or ($t -match '\.\.'))) {
@@ -246,7 +411,7 @@ foreach ($seg in $segments) {
     }
     # Here-documents feed a program a script body; `python <<EOF` is an interpreter escape
     # wearing a different hat.
-    if ($s -match '<<-?\s*[''"]?\w+') {
+    if ($sMask -match '<<-?\s*[''"]?\w+') {
         Deny("here-documents are not permitted. Put the script in a temp file and run it by path, or use a single-line -c form so its contents can be checked.")
     }
 
@@ -269,7 +434,16 @@ $denylist = @(
     # of a dangerous command is the daily work of a code reviewer; blocking it is what teaches
     # agents to route around the guard.
     ($CP + 'git\s+(?:-{1,2}[\w-]+(?:[= ]\S+)?\s+)*(commit|push|add|reset|checkout|restore|clean|rebase|merge|stash\s+(?!list|show)|am|cherry-pick|revert|switch|rm|mv|filter-branch|update-ref|gc|worktree\s+(add|remove)|remote\s+(add|remove|set-url)|reflog\s+delete)\b'),
-    ($CP + '(rm|rmdir|unlink|shred|cp|mv|touch|mkdir|ln|install|dd|truncate|fallocate|mkfs|fdisk|parted)\s'),
+    # `cp` IS DELIBERATELY ABSENT FROM THIS ALTERNATION and handled by the rule below instead --
+    # it is the one mutator with a legitimate shape (staging a Tier 2 sandbox). Everything else
+    # here stays a flat refusal.
+    ($CP + '(rm|rmdir|unlink|shred|mv|touch|mkdir|ln|install|dd|truncate|fallocate|mkfs|fdisk|parted)\s'),
+    # `cp` fires UNLESS the FINAL token of the segment is a temp path. Anchoring on the last token
+    # is the whole rule: a "mentions a temp path" check would allow
+    # `cp /tmp/evil.psm1 hooks/guard.ps1`, where the SOURCE is in temp and the destination is the
+    # guard itself. Destination validation is load-bearing here in a way it is nowhere else in
+    # this file, which is why it has paired corpus cases for source/destination confusion.
+    ($CP + 'cp\b(?![^;|&]*\s(?:[A-Za-z]:)?[\\/]?(?:[^\s;|&]*[\\/])?(?:temp|tmp)[\\/][^\s;|&]*\s*(?=$|[;|&]))'),
     '\bfind\b[^|;&]*-(delete|exec\s+(rm|mv|cp|chmod|sed)\b)',
     ($CP + '(Remove-Item|Clear-Content|Set-Content|Out-File|Add-Content|New-Item|Rename-Item|Move-Item|Copy-Item|Set-ItemProperty|New-ItemProperty)\b'),
     '\|\s*(Remove-Item|Clear-Content|Set-Content|Out-File|Add-Content|New-Item|Rename-Item|Move-Item|Copy-Item|Tee-Object)\b',
@@ -315,9 +489,13 @@ $denylist = @(
      '(os\.system|os\.popen|os\.exec|subprocess|child_process|\bsystem\s*\()')
 )
 
+# THE DENYLIST READS $maskedCmd, not $cmd. A quoted search pattern belonging to a read-only
+# searcher has been blanked; everything else is byte-identical. A real `| Set-Content` is
+# untouched -- and would already have died at the allowlist, since the segment splitter gives it
+# its own segment whose head no row admits.
 foreach ($p in $denylist) {
     try {
-        $hit = [regex]::IsMatch($cmd, $p,
+        $hit = [regex]::IsMatch($maskedCmd, $p,
                                 [Text.RegularExpressions.RegexOptions]::IgnoreCase, $MATCH_TIMEOUT)
     } catch [Text.RegularExpressions.RegexMatchTimeoutException] {
         Deny("evaluating this command took over 2s. It fails CLOSED.")

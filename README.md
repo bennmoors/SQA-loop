@@ -94,6 +94,15 @@ been the *obvious* spelling of its verb — the score measured the author's imag
 guard. An allowlist inverts the burden: a novel spelling of `rm` fails for the same reason a novel
 spelling of anything else does. It is not a read.
 
+Shell and PowerShell review was added in two tiers. **Tier 1** is static analysis — `shellcheck`,
+`shfmt`, `bash -n`, PSScriptAnalyzer and InjectionHunter — with write modes refused at *flag* level
+rather than binary level. **Tier 2** is code-executing test runners (`bats`, `Invoke-Pester`), which
+are constrained by *where* the target is: a disposable copy staged into temp, never the live repo
+or the installed `~/.claude`. The detail worth knowing before trusting any of it is in
+[docs/GUARDS.md](docs/GUARDS.md) — in particular that `-F` and `-Fi` both bind to PSScriptAnalyzer's
+`-Fix`, so denying the literal string does nothing, and that a temp sandbox bounds what the tests
+*modify* without sandboxing what the code *can do*.
+
 **`fixer-scope-guard.ps1`** — refuses writes from `code-reviewer` to `qa-harness/`, `qa-history/`,
 `qa-backups/`, `agents/`, `hooks/`, `tools/`, `settings.json` and `CLAUDE.md`. A fixer that can edit
 its own scorer is the same defect as one that can edit its own tests.
@@ -180,7 +189,7 @@ Stated plainly, because a review suite that oversells itself is worse than none.
 - **`fixer-scope-guard.ps1` has four known bypasses.** Its corpus scores **47/51 (92.2%)**, and the
   four failing must-block cases are documented in [docs/GUARDS.md](docs/GUARDS.md#known-gaps): an
   interpreter one-liner writing the guard, `perl -pi`, `git checkout` reverting the ledger, and
-  `cd` followed by a relative redirect. The Bash allowlist (`107/107`) does not share them. A
+  `cd` followed by a relative redirect. The Bash allowlist (`153/153`) does not share them. A
   fifth — a nested shell running `Set-Content` — was closed on 2026-08-24 along with the whole
   PowerShell cmdlet-write class. Know this before you rely on the fixer boundary.
 - **Mutation score is necessary, not sufficient.** 4–39% of mutants are equivalent and unkillable,

@@ -58,7 +58,7 @@ The bar: **the port must score identically to the PowerShell original, case for 
 
 | Corpus | Score | Note |
 |---|---|---|
-| `guard_corpus` | **107/107 = 100.0%** (block 70/70, allow 37/37) | the bar to match |
+| `guard_corpus` | **153/153 = 100.0%** (block 98/98, allow 55/55) | the bar to match |
 | `scope_corpus` | **47/51 = 92.2%** (block 32/36, allow 15/15) | four known upstream bypasses — see [GUARDS.md](GUARDS.md#known-gaps) |
 
 A port that "fixes" the four `scope_corpus` failures is doing two things at once. Land the port at
