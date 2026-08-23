@@ -106,7 +106,7 @@ $ClaudeDir = Join-Path $HOME '.claude'
 $Payload = @(
     @{ From = 'agents';     To = 'agents';     Desc = '7 agent definitions' }
     @{ From = 'hooks';      To = 'hooks';      Desc = '2 PreToolUse guards' }
-    @{ From = 'tools';      To = 'tools';      Desc = 'perf_probe measurement wrapper' }
+    @{ From = 'tools';      To = 'tools';      Desc = 'perf_probe (measures) + lint_probe (parses)' }
     @{ From = 'qa-harness'; To = 'qa-harness'; Desc = 'invariant checkers + behavioural corpora' }
     @{ From = 'qa-history'; To = 'qa-history'; Desc = 'ledger protocol + template' }
     @{ From = 'skills';     To = 'skills';     Desc = 'the /sqa-loop skill' }

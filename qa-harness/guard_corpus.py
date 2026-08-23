@@ -322,6 +322,36 @@ CASES = [
     ("scan-chained-after-allowed", BLOCK, "semgrep --config=auto src/ && rm -rf build/",
      "the new rows must not become a chaining vector: every segment is matched WHOLE, so an "
      "allowed scanner cannot carry a write past the guard"),
+
+    # ------------------------------------------------------------------ LINT PROBE, 2026-08-24
+    # tools/lint_probe.py is the shell/PowerShell static-analysis instrument. It needs NO new
+    # allowlist row -- the existing `python \S+\.py` entry already covers it, which is precisely
+    # why it is a Python wrapper instead of the agents calling Invoke-ScriptAnalyzer directly.
+    # Reaching that cmdlet from Bash means `pwsh -Command`, and measured 2026-08-24 the denylist
+    # behind the allowlist has ZERO PowerShell payload rules and cannot see inside quotes at
+    # command position at all, so such a row would have nothing behind it.
+    #
+    # These cases exist because "obviously already covered" is how the last several gaps got in.
+    # Two-sided: the must-block mates prove a read-only instrument has not become a writer via
+    # redirect, nor a chaining vector.
+    ("lint-probe-env", ALLOW, "python C:/Users/example/.claude/tools/lint_probe.py --mode env",
+     "backend availability; runs nothing at all, against any target"),
+    ("lint-probe-ps1", ALLOW,
+     "python C:/Users/example/.claude/tools/lint_probe.py --lang ps1 --files hooks/guard.ps1",
+     "the PowerShell path. lint_probe PARSES and has no --run, ever"),
+    ("lint-probe-sh", ALLOW,
+     "python C:/Users/example/.claude/tools/lint_probe.py --files deploy.sh lib.sh",
+     "the shell path, multiple targets"),
+    ("lint-probe-redirect", BLOCK,
+     "python C:/Users/example/.claude/tools/lint_probe.py --mode env > report.json",
+     "a read-only tool must not become a writer via redirect. Redirect containment is checked "
+     "BEFORE the allowlist precisely because the head of this command is allowed"),
+    ("lint-probe-chained", BLOCK,
+     "python C:/Users/example/.claude/tools/lint_probe.py --files x.ps1 && rm -rf build/",
+     "must not become a chaining vector"),
+    ("lint-probe-cmdsub", BLOCK,
+     "python C:/Users/example/.claude/tools/lint_probe.py --files $(cat targets.txt)",
+     "command substitution is refused outright; its contents are a command in their own right"),
 ]
 
 # ------------------------------------------------------------------------------- THE GATE

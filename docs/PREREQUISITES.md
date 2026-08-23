@@ -112,6 +112,16 @@ none of it installed the specialists read and reason, and report that no tool ra
 > version an existing suite was written against before calling anything a defect — v6 removed
 > `-Pending` and moved discovery/execution to per-file.
 
+**All of it is reached through `tools/lint_probe.py`, which parses and never runs.** There is no
+`--run` and there never will be; that is the property that lets it be pointed at an unknown script
+with no sandbox. It wraps ShellCheck, `bash -n`, PSScriptAnalyzer, InjectionHunter and a set of
+first-party PowerShell AST checks behind one JSON envelope shared with `perf_probe.py`, and it owns
+the severity mapping — style rules are capped at Suggestion so they can never gate a verdict.
+Calibration, measured on this repo's own files: raw PSSA reports **34 findings on `install.ps1`,
+30 of them `PSAvoidUsingWriteHost`**, and **0 on `fixer-scope-guard.ps1`, a file with a proven
+write bypass**. Under the shipped policy those become 4 findings (1 Warning) and 2 respectively.
+Raw linter output is not a report.
+
 **Write modes are blocked at flag level, never binary level.** `shfmt -w`/`--write` and
 `Invoke-ScriptAnalyzer -Fix` are refused while the read-only forms are allowed. For the PowerShell
 cmdlet this is a **positive parameter allowlist**, not a match on the string `-Fix`: PowerShell
@@ -236,9 +246,16 @@ suite uses no MCP servers and no network access of its own.
 ```powershell
 .\install.ps1 -Verify                      # the three mechanical gates
 python ~/.claude/tools/perf_probe.py --mode env
+python ~/.claude/tools/lint_probe.py --mode env
 ```
 
-`--mode env` runs nothing and reports what is measurable right now — EMI availability, the WSL
+`lint_probe.py --mode env` is the same idea for static analysis: it reports whether ShellCheck
+answered natively or via WSL, whether PSScriptAnalyzer and InjectionHunter loaded, and **which
+optional ShellCheck rules were enabled**. That last line is the one to read — SC2002 and the
+`set -e` checks are opt-in as of 0.11.0, so a shell report produced without them is clean for the
+wrong reason. It analyses nothing and runs no target.
+
+`perf_probe.py --mode env` runs nothing and reports what is measurable right now — EMI availability, the WSL
 lane, which Python packages resolve, LibreHardwareMonitor, the Impact Framework, and the resolved
 host configuration including whether any override is in effect. It is the honest answer to "why
 did that mode refuse?", and the agents are instructed to run it when they need to explain a
