@@ -190,13 +190,19 @@ function Invoke-Gates {
     if ($LASTEXITCODE -eq 0) {
         Write-Ok 'every case behaved as required'
     } elseif ($LASTEXITCODE -eq 1) {
-        # Known state as of 2026-08-21: 34/39, five must-block cases fail. They are documented
-        # bypasses of fixer-scope-guard.ps1 (interpreter write, perl -pi, nested-shell Set-Content,
-        # git checkout, cd-then-relative-redirect), not a broken install. Reported, never hidden.
-        Write-Warn "34/39 expected -- five must-block cases are known-failing UPSTREAM, not an"
-        Write-Warn "install fault: interpreter write, perl -pi, nested-shell Set-Content, git"
-        Write-Warn "checkout, cd-then-relative-redirect. Read docs/GUARDS.md 'Known gaps' before"
-        Write-Warn "relying on the fixer boundary. The Edit/Write path is unaffected."
+        # Known state as of 2026-08-24: 47/51, FOUR must-block cases fail. They are documented
+        # bypasses of fixer-scope-guard.ps1 (interpreter write, perl -pi, git checkout,
+        # cd-then-relative-redirect), not a broken install. Reported, never hidden.
+        #
+        # WAS five, and this message said so until 2026-08-24. The fifth -- a nested shell writing
+        # through a PowerShell cmdlet -- is now CLOSED, along with the whole cmdlet-write class it
+        # stood for (Set-Content/Out-File/New-Item/Add-Content, positional and named-parameter
+        # forms alike). A stale "known gap" note is the exact failure R3 names: correct when
+        # written, silently false later, and reassuring in both states.
+        Write-Warn "47/51 expected -- four must-block cases are known-failing UPSTREAM, not an"
+        Write-Warn "install fault: interpreter write, perl -pi, git checkout, and"
+        Write-Warn "cd-then-relative-redirect. Read docs/GUARDS.md 'Known gaps' before relying"
+        Write-Warn "on the fixer boundary. The Edit/Write path is unaffected."
     } else {
         Write-Fail "exit $LASTEXITCODE -- the corpus could not run at all. This IS an install"
         Write-Fail "fault, not the known-gaps case. Check that qa-harness/ and hooks/ arrived."

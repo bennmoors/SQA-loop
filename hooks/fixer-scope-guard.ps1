@@ -64,7 +64,27 @@ $protected = @(
     @{ re = '(?i)/\.claude/tools(/|$)'
        why = 'a measurement wrapper. A fixer that can edit the instrument that scores its own fix can make any number say anything.' },
     @{ re = '(?i)/\.claude/(settings\.json|CLAUDE\.md)$'
-       why = 'the session configuration and the operating contract -- the two files that decide what every later run is allowed to do.' }
+       why = 'the session configuration and the operating contract -- the two files that decide what every later run is allowed to do.' },
+    # PROTOCOL.md R4 names THREE exclusions -- qa-history, qa-harness, and a skill's own
+    # scripts/tests. Only the first two were enforced here, because every rule above is anchored
+    # on `/.claude/` and that was true of the skills too until 2026-08-04, when prelearn and
+    # postlearn were relocated into the OneDrive tree
+    # (.../UNIVERSITY/.claude/skills/<skill>/scripts/tests/). None of the `/\.claude/<name>` rules
+    # match `/.claude/skills/...`, so from that date the fixer could edit the very suites that gate
+    # its own iterations -- the defect CLAUDE.md calls "the same defect as one that can edit its
+    # own scorecard".
+    #
+    # HISTORY, because this rule was added, reverted and re-added inside one session, and the next
+    # reader deserves a reason rather than churn. Added 2026-08-21 during the RUN 5 efficiency
+    # loop; reverted the same day because `scope_corpus.py` deliberately ALLOWED a repro-test
+    # write, and regressing a corpus on the strength of one's own opinion is exactly backwards.
+    # The user then ruled explicitly -- "Do not let the fixer edit" -- which settles the conflict
+    # in R4's favour, and the corpus expectation moved with it in the same commit.
+    #
+    # Anchored on `(/|$)` like every rule above: a trailing-slash-plus-filename shape let
+    # `rm -rf .../qa-history` through on 2026-08-10.
+    @{ re = '(?i)/skills/[^/]+/(scripts/)?tests(/|$)'
+       why = "a skill's own test suite, which is the guard an SQA loop reverts iterations against. A fixer that can edit its own tests can make any iteration pass (PROTOCOL.md R4; user ruling 2026-08-21)." }
 )
 
 function Deny([string]$what, [string]$why) {
@@ -95,6 +115,49 @@ if ($cmd) {
     foreach ($m in [regex]::Matches($cmd, '\bsed\b[^|;&]*?(?:-i|--in-place)\S*\s+(?:''[^'']*''|"[^"]*"|\S+)\s+(?<t>[^\s|;&]+)')) {
         $targets.Add($m.Groups['t'].Value.Trim('"', "'"))
     }
+    # POWERSHELL CMDLET WRITES. The POSIX pass above cannot see them, and the gap was measured
+    # 2026-08-23: `Set-Content`, `Out-File`, `New-Item` and `Add-Content` all reached
+    # ~/.claude/agents and ~/.claude/qa-history UNBLOCKED, while every POSIX spelling of the same
+    # write was refused. The guard's coverage therefore depended on which language the fixer
+    # happened to reach for -- and this suite is about to make PowerShell traffic routine, which
+    # turns a latent hole into a load-bearing one.
+    #
+    # TWO REASONS THE MUTATOR PASS ABOVE MISSES THESE, both of which this block has to handle:
+    #   1. `Set-Content` names no POSIX verb, so that alternation never matches.
+    #   2. Its target arrives as the VALUE of a NAMED PARAMETER (`-Path X`), and the mutator pass
+    #      discards every token starting with `-`. A named-parameter value was only ever reachable
+    #      positionally, so writing `-Path` was by itself enough to defeat it.
+    #
+    # A read-only searcher is exempted BY HEAD: `grep -rn "Set-Content" ~/.claude/qa-harness/`
+    # names both a protected path and a cmdlet while writing nothing, and reviewing PowerShell is
+    # precisely the work that generates that command. Refusing it teaches routing around the guard.
+    $psWriters = 'Set-Content|Out-File|Add-Content|New-Item|Clear-Content|Remove-Item|' +
+                 'Rename-Item|Move-Item|Copy-Item|Set-ItemProperty|New-ItemProperty|' +
+                 'Tee-Object|Export-Csv|Export-Clixml|Set-Acl'
+    $psTargetParams = 'Path|LiteralPath|FilePath|Destination|OutFile|Target|NewName'
+    $searcherHead = '^\s*(?:grep|egrep|fgrep|rg|ag|ack|findstr|Select-String)\b'
+
+    if ($cmd -notmatch $searcherHead) {
+        foreach ($m in [regex]::Matches($cmd, "\b(?:$psWriters)\b(?<args>[^;|&]*)",
+                                        [Text.RegularExpressions.RegexOptions]::IgnoreCase)) {
+            $toks = @($m.Groups['args'].Value -split '\s+' | Where-Object { $_ })
+            for ($j = 0; $j -lt $toks.Count; $j++) {
+                $tok = $toks[$j]
+                if ($tok -imatch "^-(?:$psTargetParams)$") {
+                    # Named parameter: the target is the NEXT token, not this one.
+                    if ($j + 1 -lt $toks.Count) { $targets.Add($toks[$j + 1].Trim('"', "'")) }
+                } elseif ($tok -imatch "^-(?:$psTargetParams):(?<v>.+)$") {
+                    # `-Path:value` colon form binds with no space between name and value.
+                    $targets.Add($Matches['v'].Trim('"', "'"))
+                } elseif ($tok -notmatch '^-') {
+                    # Positional: `Set-Content <path> <value>` binds -Path positionally. Collecting
+                    # the value token too is harmless -- only a PROTECTED path can trigger a Deny.
+                    $targets.Add($tok.Trim('"', "'"))
+                }
+            }
+        }
+    }
+
     foreach ($t in $targets) {
         $tn = $t -replace '\\', '/'
         foreach ($rule in $protected) { if ($tn -imatch $rule.re) { Deny $t $rule.why } }

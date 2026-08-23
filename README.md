@@ -177,11 +177,12 @@ cross-platform guard would have to satisfy, and how the existing corpora would v
 
 Stated plainly, because a review suite that oversells itself is worse than none.
 
-- **`fixer-scope-guard.ps1` has five known bypasses.** Its corpus scores **34/39 (87.2%)**, and the
-  five failing must-block cases are documented in [docs/GUARDS.md](docs/GUARDS.md#known-gaps): an
-  interpreter one-liner writing the guard, `perl -pi`, a nested shell running `Set-Content`,
-  `git checkout` reverting the ledger, and `cd` followed by a relative redirect. The Bash allowlist
-  (`107/107`) does not share them. Know this before you rely on the fixer boundary.
+- **`fixer-scope-guard.ps1` has four known bypasses.** Its corpus scores **47/51 (92.2%)**, and the
+  four failing must-block cases are documented in [docs/GUARDS.md](docs/GUARDS.md#known-gaps): an
+  interpreter one-liner writing the guard, `perl -pi`, `git checkout` reverting the ledger, and
+  `cd` followed by a relative redirect. The Bash allowlist (`107/107`) does not share them. A
+  fifth — a nested shell running `Set-Content` — was closed on 2026-08-24 along with the whole
+  PowerShell cmdlet-write class. Know this before you rely on the fixer boundary.
 - **Mutation score is necessary, not sufficient.** 4–39% of mutants are equivalent and unkillable,
   so part of any climb is theatre.
 - **No security scan happens unless you install a scanner.** `sqa-security` reads and reasons by
