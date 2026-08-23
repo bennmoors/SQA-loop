@@ -462,6 +462,36 @@ def check_one(res: Result, path: Path, settings: dict | None):
     res.check(fm is not None, f"{tag}: frontmatter delimited by --- markers")
     if fm is None:
         return None
+
+    # THE ONE THAT WAS MISSING, added 2026-08-23 after it cost a whole specialist.
+    #
+    # `sqa-functional.md` sat on disk, readable, with every field this checker looks for, and
+    # Claude Code SILENTLY REFUSED TO REGISTER IT -- so `sqa-lead` dispatched three specialists
+    # instead of four and reported no error. Cause: an unquoted `description:` scalar containing
+    # an embedded ": ", which is a YAML syntax error. `sqa-efficiency.md` had the identical defect
+    # and happened to survive the loader, i.e. it was luck, not correctness.
+    #
+    # Why this checker could not see it: yaml_scalars() below is a LENIENT hand-rolled extractor.
+    # It pulls out the fields it wants and never asks whether the document is well-formed, so a
+    # file that no real parser accepts still passed every other check here -- including
+    # "every specialist sqa-lead names exists as an agent", which reported the agent as present.
+    # A checker that reads files cannot see a registry, so it must at least verify the thing the
+    # registry will parse.
+    try:
+        import yaml as _yaml
+    except ImportError:
+        res.skip(f"{tag}: frontmatter is valid YAML", "PyYAML not installed")
+    else:
+        try:
+            _yaml.safe_load(fm)
+            res.check(True, f"{tag}: frontmatter is valid YAML")
+        except Exception as exc:
+            first = str(exc).strip().splitlines()[0][:120]
+            res.check(False, f"{tag}: frontmatter is valid YAML",
+                      f"{type(exc).__name__}: {first} -- Claude Code will refuse to load this "
+                      f"agent and will NOT report an error. Usually an unquoted value containing "
+                      f'": "; quote the scalar.')
+
     meta = yaml_scalars(fm)
 
     # ------------------------------------------------------------------ identity

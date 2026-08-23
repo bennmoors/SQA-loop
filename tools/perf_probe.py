@@ -64,6 +64,7 @@ import ast
 import json
 import os
 import re
+import shlex
 import statistics
 import subprocess
 import sys
@@ -361,8 +362,18 @@ def guard_command_string(shape: dict) -> str:
     DERIVED FROM local_argv() so the two can never drift. Showing the guard a command
     that differs from the one about to run is the whole failure mode this wrapper exists
     to prevent, so it must be structurally impossible, not merely intended.
+
+    QUOTED with shlex.join, not " ".join. A bare join hands the guard's tokenizer an
+    argument's internal punctuation as if it were shell syntax: measured 2026-08-21 on a
+    real documented argv, `--concepts "Power Cycles; Otto Cycle; Diesel Cycle"` was split
+    at the semicolons and refused with "'Otto' is not on the allowlist (full segment:
+    'Otto Cycle')". That made a whole baseline case unmeasurable through this instrument
+    while the command itself was perfectly legitimate -- postlearn/SKILL.md specifies
+    exactly that `--concepts "<t1; t2; t3>"` shape. shlex.join leaves tokens that need no
+    quoting untouched (so a bare `foo.py` operand stays bare, which the guard's
+    `\\S+\\.py` rule requires) and quotes only the ones that do.
     """
-    return " ".join(local_argv(shape, "python"))
+    return shlex.join(local_argv(shape, "python"))
 
 
 def reapply_guard(command: str) -> None:
@@ -1031,7 +1042,29 @@ def mode_bench(args, shape) -> int:
     user_site = site.getusersitepackages()
     env["PYTHONPATH"] = os.pathsep.join(
         [p for p in (user_site, env.get("PYTHONPATH", "")) if p])
-    argv = [sys.executable, "-m", "pyperf", "command",
+    # --copy-env is REQUIRED, not a convenience. pyperf's create_environ()
+    # (pyperf/_utils.py:262-267) copies only a whitelist -- PATH, HOME, TEMP, COMSPEC,
+    # SystemRoot, SystemDrive, PYTHONPATH, PYTHON_CPU_COUNT, PYTHON_GIL, PYPERF_* -- into
+    # the worker. Any target that resolves a path from the environment therefore runs in a
+    # DIFFERENT world than it normally does, and usually fails there.
+    #
+    # Measured 2026-08-21, and this cost an hour before it was understood: every prelearn
+    # and postlearn target reads %ONEDRIVE% to locate the course root
+    # (week_topics.py:1260). Stripped, the root goes relative, the unit is not found, the
+    # script exits 3, and pyperf's manager reports only `RuntimeError: python.exe failed
+    # with exit code 1` -- an error that names neither the variable nor the target. Proof
+    # chain: full env -> exit 0; pyperf's whitelist alone -> exit 3; whitelist + ONEDRIVE
+    # -> exit 0; and the identical invocation with --copy-env benches fine (1.15s +- 0.03).
+    #
+    # NOTE the case: the variable is ONEDRIVE, not OneDrive -- Windows os.environ
+    # normalises keys to upper case, so `--inherit-environ=OneDrive` injects a literal
+    # that matches nothing. `--inherit-environ=ONEDRIVE` was ALSO measured not to work
+    # here, which is why this uses --copy-env rather than a minimal allow-list.
+    #
+    # This is not a privilege escalation: the worker gets the same environment the command
+    # already runs in when invoked directly, which is the environment a faithful
+    # measurement has to reproduce.
+    argv = [sys.executable, "-m", "pyperf", "command", "--copy-env",
             "--processes", str(args.processes), "--values", str(args.values),
             "-o", str(out), "--"] + local_argv(shape, sys.executable)
     try:
@@ -1041,9 +1074,15 @@ def mode_bench(args, shape) -> int:
         return emit("bench", True, {"timed_out": True, "timeout_s": args.timeout,
                                     "finding": "workload did not finish; that is a finding."})
     if not out.is_file():
+        # 2400, not 600. pyperf's failure output is its MASTER's traceback (~20 frames
+        # through _runner/_manager), and the worker's real error -- the line naming what
+        # actually went wrong -- sits ABOVE it. A 600-char tail showed only the master's
+        # RuntimeError, which is why a plain env-stripping failure read as "pyperf
+        # swallows its own stderr" for an hour on 2026-08-21. It does not; we were
+        # truncating it.
         raise Refusal("mode-bench",
                       f"pyperf produced no result (exit {r.returncode}): "
-                      f"{(r.stderr or '')[-600:]}")
+                      f"{(r.stderr or '')[-2400:]}")
     d = json.loads(out.read_text(encoding="utf-8"))
     values = []
     for b in d.get("benchmarks", []):

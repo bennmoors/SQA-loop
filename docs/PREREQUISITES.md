@@ -81,6 +81,43 @@ invisible on a machine with no scanners installed, which is exactly the trap R3 
 
 Both are allowlisted read-only; `clang-tidy -fix`, `-fix-errors` and `-fix-notes` are blocked.
 
+### Shell and PowerShell review — `sqa-functional`, `sqa-security`, `sqa-efficiency`
+
+A `.ps1` or `.sh` target routes to the same five specialists a `.py` target does; language changes
+which instruments they reach for, never which domains apply. **None of this is required** — with
+none of it installed the specialists read and reason, and report that no tool ran. What each buys:
+
+| Tool | Install | Without it |
+|---|---|---|
+| **ShellCheck** | `winget install koalaman.shellcheck` | no shell linting and no dialect check; `sh -n` does not substitute — see below |
+| **shfmt** | `winget install mvdan.shfmt` | no formatting diff. Read-only modes only: `-d`, `-l`, bare stdout |
+| **bats-core** | `sudo apt-get install -y bats` (WSL) | `sqa-functional` cannot run an existing shell test suite |
+| **PSScriptAnalyzer** | `Install-Module PSScriptAnalyzer -Scope AllUsers` | no PowerShell linting; the first-party AST checks still run |
+| **InjectionHunter** | `Install-Module InjectionHunter -Scope AllUsers` | no PowerShell injection rules — PSSA's 75 defaults do not carry them |
+| **Pester 6.x** | `Install-Module Pester -MinimumVersion 6.0 -Scope AllUsers` | no PowerShell test execution, and no Cobertura coverage |
+| **hyperfine** | `winget install sharkdp.hyperfine` | no shell A/B benchmark; `sqa-efficiency` stays static-only on shell targets |
+
+> **`sh -n` is not a dialect check, and that is the trap.** It parses `[[` and `local` as ordinary
+> command words and exits **0** on a `#!/bin/sh` script full of bashisms. `shellcheck -s sh` is what
+> catches them (SC3010, SC3043). Never let a green `sh -n` stand in for it.
+
+> **ShellCheck's highest-value checks are OFF by default.** As of 0.11.0, SC2002 (useless use of
+> `cat`) and the `set -e` suppression checks are opt-in. Run bare and the efficiency axis silently
+> loses UUOC while the functional axis silently loses both `set -e` checks — a clean report then
+> proves nothing. `tools/lint_probe.py` passes a curated `--enable=` set and **records which optional
+> rules were enabled in its JSON**, so a degraded run is visible rather than assumed.
+> `require-double-brackets` is deliberately never enabled: it is wrong on a POSIX target.
+
+> **Pester 3.4.0 ships with Windows and cannot run 6.x syntax.** Both coexist. Establish which
+> version an existing suite was written against before calling anything a defect — v6 removed
+> `-Pending` and moved discovery/execution to per-file.
+
+**Write modes are blocked at flag level, never binary level.** `shfmt -w`/`--write` and
+`Invoke-ScriptAnalyzer -Fix` are refused while the read-only forms are allowed. For the PowerShell
+cmdlet this is a **positive parameter allowlist**, not a match on the string `-Fix`: PowerShell
+binds any unambiguous prefix, so `-F` and `-Fi` both reach `-Fix` and a negative match would be
+bypassed by typing one fewer character.
+
 ### `sqa-efficiency` — measurement
 
 This agent measures **only** through `tools/perf_probe.py`. It never invokes a profiler directly.
