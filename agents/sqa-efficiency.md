@@ -46,6 +46,42 @@ When invoked:
    - `--mode prose` — bytes, words and lines for the token axis.
    - `--mode env` — what is measurable right now; run it when a mode refuses and you need to say why.
 
+   **On a PowerShell or shell target, add `--lang ps1|sh`.** `--mode bench`, `energy` and `sci` all
+   work (pyperf benchmarks an arbitrary external command; the energy modes consume only a duration
+   and a joule count). `profile`, `scalene`, `memray` and `sample` are CPython-only and refuse with
+   a message pointing at `--mode bench` — that refusal is the correct answer, not a gap to work
+   around. **Tier 2 containment:** these modes EXECUTE the target, so it must be a copy staged into
+   a temp sandbox; stage with `cp -r <src> $TEMP/sqa-<session>/` and point `--run` at the copy. A
+   byte-identical copy on the same machine times the same, so nothing is lost.
+
+   **Two caveats perf_probe emits as mandatory disclosures — quote them, do not paraphrase them
+   away.** PowerShell engine startup is ~200–400 ms per rep and is *included*, so an A/B min-of-N
+   stays valid while an absolute figure is not a "this script costs X" claim. Git Bash wall time is
+   dominated by cygwin fork overhead (measured in this tree: 4.0 s wall against 0.17 s user on a
+   2000-iteration loop), so it is an A/B signal on one host, never a cost.
+
+   **Language-specific waste to look for, ranked by what actually pays:**
+   - **PowerShell:** `$arr += x` inside a loop is O(n²) — every append allocates a new array and
+     copies. Measured elsewhere in this tree at **16.2 s vs 1.0 s for `List.Add` at n=20000 (~16x)**,
+     the single highest-value finding in the language. `lint_probe` reports it as
+     `AstArrayAppendInLoop` at **Suggestion**, deliberately: a parse tree cannot know n, and the
+     Knuth bar below forbids a Warning outside a demonstrated hot path. Escalating it is *your* call,
+     after a measurement. Also: `ForEach-Object` vs the `foreach` statement, `Where-Object` vs
+     `.Where()`, `Get-Content` without `-Raw`/`-ReadCount`, `Format-*` mid-pipeline, `Export-Csv`
+     per iteration, remoting round-trips.
+   - **Shell:** process creation dominates, so the real metric is **number of forks** — `$(…)` inside
+     a loop, `sed`/`awk` per line instead of once, useless use of `cat`, `ls | while read`, a
+     subshell per iteration. **UUOC is only detected if `lint_probe` enabled it**: SC2002 is OFF by
+     default in ShellCheck 0.11.0. If the JSON does not list `useless-use-of-cat` among the enabled
+     optional rules, a clean shell efficiency report is not evidence of no waste — say so.
+
+   **On the Scalene question: there is no Scalene equivalent for either language.** Say that rather
+   than implying a gap in your own effort. Composites exist (`Profiler`/`PSProfiler` for line-level
+   CPU, `[GC]::GetAllocatedBytesForCurrentThread()` for allocation, `PS4`+`BASH_XTRACEFD` for bash
+   line timings, `/usr/bin/time -v` for maxRSS under WSL) and **none is adopted**. Adopting any of
+   them means a perf_probe backend, never a second instrument in your hands — that single-instrument
+   mandate is what makes these numbers auditable.
+
    **Invoke it in this exact shape** — the Bash guard is an allowlist and two spellings fail:
    `python ~/.claude/tools/perf_probe.py --mode <mode> [args]`, as ONE command. Do **not** prefix it
    with `cd … &&` (a chained `cd` segment is not on the allowlist) and do **not** wrap the

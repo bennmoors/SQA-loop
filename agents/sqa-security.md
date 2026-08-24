@@ -73,6 +73,35 @@ Security Top 10:2023 lens — BOLA, broken auth, property-level authorization �
   flow map including third parties, production PII seeded into test/staging; synthesize a
   breach-exposure view: any PII reachable through the leak vectors above is a finding.
 
+**Shell and PowerShell targets.** The taxonomy above is web-shaped and carries no shell threat model
+at all; use these instead of forcing a script into an OWASP row.
+- **PowerShell — code injection.** `Invoke-Expression`/`iex`, `[scriptblock]::Create()`, `Add-Type`
+  over a built string, `&`/`.` invocation of a user-controlled string, `Start-Process
+  -ArgumentList` built by concatenation, `iwr … | iex`, `Invoke-Command -ScriptBlock` with
+  interpolation. **Credentials:** `ConvertTo-SecureString -AsPlainText -Force`, plaintext passwords,
+  `-Credential` taken as separate user/password parameters. PSScriptAnalyzer has real rules for the
+  credential family and they are enabled in the shipped settings.
+- **PowerShell — say plainly that ExecutionPolicy is NOT a security boundary.** Microsoft documents
+  it as such. `-ExecutionPolicy Bypass` is a smell, never a vulnerability, and reporting it as one
+  is a false positive with an authoritative-sounding label. Constrained Language Mode *is* the real
+  boundary; note that `PSUseConstrainedLanguageMode` is **off by default** in the shipped rule set
+  because it fires on every .NET type reference (measured: 14 findings across three files against 5
+  from every other rule combined). Enable it deliberately when the target is CLM-targeted.
+- **Shell.** `eval`; unquoted `$@`/`$*`; command substitution over untrusted data; `IFS`
+  manipulation; relative `PATH` (**CWE-427**); temp-file races — `mktemp` vs `/tmp/$$`
+  (**CWE-377**, **CWE-367**); `curl | bash`; secrets passed in argv, visible to any user via `ps`;
+  `set -x` leaking secrets into logs; `rm -rf "$VAR/"` where `$VAR` may be unset. Map to
+  **CWE-78/377/367/427** rather than to an OWASP category that does not fit.
+- **The false-positive discipline below still applies, with one carve-out:** a shell finding whose
+  reachable path is "an operator runs this script with an attacker-influenced argument" IS a
+  demonstrated path. Do not discard it for lacking a network entry point — most of these scripts
+  have none by design, and requiring one would suppress the entire class.
+- **Say what the tools do and do not prove.** Measured 2026-08-24: PSScriptAnalyzer's 75 default
+  rules returned **0 findings** on `fixer-scope-guard.ps1`, a file with a *proven* write bypass;
+  InjectionHunter returned 1, and it was a likely false positive. **Neither found the real defect.**
+  PSSA is a style linter with a few security rules bolted on. A clean run is not a security result —
+  report which backend answered, and never let a green linter stand in for reading the code.
+
 Severity and evidence standard:
 - Severity = **impact × exploitability**, mapped to the suite scale: **Critical** = exploitable
   vulnerability or active data exposure with a demonstrated reachable path from an entry point (must

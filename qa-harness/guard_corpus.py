@@ -469,6 +469,40 @@ CASES = [
     ("echo-quoted-not-masked", BLOCK, 'echo "rm -rf build/" > hooks/g.ps1',
      "masking applies ONLY when the segment head is a read-only searcher. `echo` is not one, so "
      "its quoted text is scanned normally and the redirect still blocks"),
+
+    # --------------------------------------- PERF_PROBE DERIVED COMMANDS (--lang), 2026-08-24
+    # What `perf_probe.py --lang ps1|sh` submits to this guard from inside itself (control 2).
+    # These must land, or that mode always fails at control-2 however correct the wrapper is.
+    # THE PATH IS SINGLE-QUOTED because perf_probe derives the string with shlex.join, which
+    # quotes any token containing a backslash -- and Path.resolve() always yields backslashes on
+    # Windows. Measured; an unquoted-only row would have refused every real invocation.
+    ("perf-ps1-sandbox", ALLOW,
+     r"pwsh -NoProfile -NonInteractive -File 'C:\Users\example\AppData\Local\Temp\sqa-a1\w.ps1'",
+     "the derived command for --lang ps1, against a staged copy"),
+    ("perf-sh-sandbox", ALLOW,
+     r"bash 'C:\Users\example\AppData\Local\Temp\sqa-a1\w.sh'",
+     "the derived command for --lang sh"),
+    ("perf-ps1-forward-slash", ALLOW,
+     "pwsh -NoProfile -NonInteractive -File C:/Users/example/AppData/Local/Temp/sqa-a1/w.ps1",
+     "a forward-slash path is not quoted by shlex.join; both spellings must land"),
+    ("perf-ps1-repo-path", BLOCK,
+     r"pwsh -NoProfile -NonInteractive -File 'C:\Users\example\SQA-loop\hooks\g.ps1'",
+     "ps1 EXECUTES, so it is Tier 2: the live repo is not a sandbox"),
+    ("perf-sh-repo-path", BLOCK, r"bash 'C:\Users\example\SQA-loop\deploy.sh'",
+     "same for shell"),
+    ("perf-ps1-dotdot", BLOCK,
+     "bash 'C:/Users/example/AppData/Local/Temp/../SQA-loop/x.sh'",
+     "prefix matching on an un-normalised path is not containment"),
+    ("perf-ps1-command", BLOCK, "pwsh -NoProfile -NonInteractive -Command Get-Date",
+     "THE LINE THAT DOES NOT MOVE is inline code. -Command is refused whatever follows it, "
+     "except the two closed grammars (Invoke-ScriptAnalyzer, Invoke-Pester)"),
+    ("perf-ps1-encoded", BLOCK,
+     "pwsh -NoProfile -NonInteractive -EncodedCommand ZQBjAGgAbwA=",
+     "-EncodedCommand is inline code wearing base64; a denylist of dangerous verbs cannot see it, "
+     "which is why the rule is a SHAPE"),
+    ("perf-ps1-chained", BLOCK,
+     r"pwsh -NoProfile -NonInteractive -File 'C:\Users\example\AppData\Local\Temp\a\w.ps1' && rm -rf build/",
+     "must not become a chaining vector"),
 ]
 
 # ------------------------------------------------------------------------------- THE GATE

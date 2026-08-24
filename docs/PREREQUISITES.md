@@ -122,6 +122,15 @@ Calibration, measured on this repo's own files: raw PSSA reports **34 findings o
 write bypass**. Under the shipped policy those become 4 findings (1 Warning) and 2 respectively.
 Raw linter output is not a report.
 
+**Anything that EXECUTES the target is Tier 2 and runs only against a staged copy.** `bats`,
+`Invoke-Pester`, and `perf_probe.py --lang ps1|sh` are confined to a path inside a temp directory —
+stage with `cp -r <src> $TEMP/sqa-<session>/` and point the tool at the copy. Measurement is
+unaffected: a byte-identical copy on the same machine times the same. Two caveats the tooling emits
+for you rather than leaving you to remember: PowerShell engine startup (~200–400 ms/rep) is included
+in every figure, so an A/B stays valid while an absolute number is not a cost; and Git Bash wall time
+is dominated by cygwin fork overhead (4.0 s wall against 0.17 s user on a 2000-iteration loop,
+measured here). **A temp sandbox bounds what the tests modify — it does not sandbox the code.**
+
 **Write modes are blocked at flag level, never binary level.** `shfmt -w`/`--write` and
 `Invoke-ScriptAnalyzer -Fix` are refused while the read-only forms are allowed. For the PowerShell
 cmdlet this is a **positive parameter allowlist**, not a match on the string `-Fix`: PowerShell
@@ -247,6 +256,7 @@ suite uses no MCP servers and no network access of its own.
 .\install.ps1 -Verify                      # the three mechanical gates
 python ~/.claude/tools/perf_probe.py --mode env
 python ~/.claude/tools/lint_probe.py --mode env
+python qa-harness/run_shape_corpus.py        # perf_probe's --lang dispatch, sub-second
 ```
 
 `lint_probe.py --mode env` is the same idea for static analysis: it reports whether ShellCheck

@@ -34,6 +34,16 @@ the only agent that changes anything.
 | **security** | **triage-then-verify, critic-only. No hill-climbing. Final sign-off is the user's.** | **none — refuse to produce one** |
 | **performance** | metric loop primary, strongest guard | measured time/space, min-of-n, before/after |
 | **artifact-integrity** | `qa-harness/` invariants + mutants **are** the metric | `mutate.py <dir> --score` |
+| **functionality, on a `.ps1`/`.sh` target** | critic loop **alone** | **none — there is no mutation-testing tool for either language** |
+
+**Shell and PowerShell get no functionality metric, and that is a finding rather than a gap.**
+`cosmic-ray` is Python-only, and no mutation-testing tool exists for either language. The deeper
+blocker is that a mutation score needs a test suite to kill mutants with, and most targets in these
+languages have none — so even a tool would score noise. PHASE 0 must NOT reach for `cosmic-ray` on a
+language it cannot parse; the correct behaviour is the one already stated above — *say so and run
+the critic loop alone*, never invent a number. Static analysis via `lint_probe.py` is **evidence,
+not a metric**: its finding count is satisfiable by deleting code, which is exactly the
+"cannot be satisfied by damaging the target" test that disqualifies raw file size below.
 
 **Raw file size is NEVER an honest metric** — "cannot be satisfied by damaging the target" is
 exactly what a size metric *is* satisfied by, since deleting the file scores perfectly. Prose work

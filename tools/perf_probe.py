@@ -65,6 +65,7 @@ import json
 import os
 import re
 import shlex
+import shutil
 import statistics
 import subprocess
 import sys
@@ -173,6 +174,51 @@ ALLOWED_PY_FLAGS = {"-u"}
 
 INTERPRETER_RE = re.compile(r"^(?:python|python3|python3\.\d+|py)(?:\.exe)?$", re.I)
 
+# ---------------------------------------------------------------------------- languages
+#
+# GATED ON AN EXPLICIT FLAG, never on sniffing argv. Two reasons, and the second is the one that
+# matters: an explicit flag lets the JSON report honestly WHICH shape check ran, and `--lang py`
+# stays byte-identical for every invocation that already exists. Sniffing would silently change
+# the meaning of a command someone recorded in a ledger months ago.
+LANGS = ("py", "ps1", "sh")
+
+PS_INTERPRETER_RE = re.compile(r"^(?:powershell|pwsh)(?:\.exe)?$", re.I)
+SH_INTERPRETER_RE = re.compile(r"^(?:bash|sh)$", re.I)
+
+# The literal prefix a PowerShell target must carry. -NoProfile keeps a user's profile out of the
+# measurement, -NonInteractive stops a prompt hanging the run, and -File is what makes this a
+# SCRIPT invocation rather than -Command, which would be an inline-code channel.
+PS_REQUIRED_PREFIX = ["-NoProfile", "-NonInteractive", "-File"]
+
+# TIER 2 CONTAINMENT. `ps1` and `sh` targets EXECUTE, which puts them in the same class as
+# Invoke-Pester and bats: they may only run against a disposable copy staged into temp, never the
+# live repo or the installed ~/.claude.
+#
+# THIS IS ENFORCED HERE RATHER THAN IN THE GUARD, and the reason is structural. local_argv()
+# rewrites a Python target to its BASENAME (see the module docstring), so for `py` the guard never
+# sees a path at all and could not enforce location even if asked. Rather than make the guard
+# pretend to a check it cannot perform, containment is asserted at the one place that holds the
+# resolved absolute path. For ps1/sh local_argv keeps the FULL path precisely so the guard can
+# check it too -- belt and braces, with the authoritative check here.
+TEMP_SEGMENT_RE = re.compile(r"[\\/](?:temp|tmp)[\\/]", re.I)
+
+
+def assert_sandboxed(script: Path, lang: str) -> None:
+    """A ps1/sh target must resolve inside a temp directory. Refuses otherwise."""
+    s = str(script)
+    if ".." in s:
+        raise Refusal("control-3-shape",
+                      f"--run target {s!r} contains '..'. Prefix matching on an un-normalised "
+                      "path is not a containment check.")
+    if not TEMP_SEGMENT_RE.search(s):
+        raise Refusal("control-3-shape",
+                      f"--lang {lang} executes the target, so it may only run against a copy "
+                      f"staged into a temp sandbox; {s!r} is not under one. Stage it first "
+                      "(`cp -r <src> $TEMP/sqa-<session>/`) and point --run at the copy. "
+                      "Measurement is unaffected: a byte-identical copy on the same machine "
+                      "times the same. What this does NOT do is sandbox the code -- a staged "
+                      "script still runs with your full privileges.")
+
 # Timing/energy claims are worthless without this attached. Emitted on every measuring run.
 NOISE_DISCLOSURE = [
     "Windows offers no CPU isolation; `pyperf system tune` is non-functional on this host.",
@@ -183,6 +229,36 @@ NOISE_DISCLOSURE = [
 ENERGY_DISCLOSURE = (
     "package-wide counter, attributed by paired-baseline subtraction, not per-process"
 )
+
+
+def lang_disclosures(shape) -> list:
+    """MANDATORY per-language caveats. Encoded here, not left to the agent to remember.
+
+    Both of these invalidate an ABSOLUTE number while leaving an A/B comparison intact, which is
+    a distinction an agent reading a bare millisecond figure will not make on its own.
+    """
+    if not shape:
+        return []
+    lang = shape.get("lang", "py")
+    if lang == "ps1":
+        return [
+            "PowerShell engine startup is ~200-400 ms per rep and is INCLUDED in every "
+            "measurement here. An A/B min-of-N stays valid (identical startup on both arms); an "
+            "absolute figure is NOT a 'this script costs X' claim.",
+        ]
+    if lang == "sh":
+        interp = resolve_interpreter(shape)
+        flavour = "Git Bash (MSYS2)" if "Git" in interp or "usr/bin" in interp.replace("\\", "/") \
+            else interp
+        return [
+            f"The shell that answered was: {interp}",
+            "GIT BASH WALL TIME IS NOT COMPARABLE TO NATIVE. Measured in this tree: a "
+            "2000-iteration loop took 4.0 s wall against 0.17 s user, dominated by cygwin fork "
+            "overhead. Treat wall time here as an A/B signal on one host only, never as a cost.",
+        ] if "Git" in flavour or "MSYS" in flavour else [
+            f"The shell that answered was: {interp}",
+        ]
+    return []
 
 # ---------------------------------------------------------------------------- envelope
 
@@ -298,11 +374,89 @@ def split_run_argv(argv: list[str]) -> tuple[list[str], list[str]]:
     return argv[:i], argv[i + 1:]
 
 
-def check_run_shape(run_argv: list[str]) -> dict:
-    """Control 3. argv[0] a Python interpreter, argv[1] a .py path or -m <allowlisted>."""
+def _resolve_target(target: str, suffixes: tuple, lang: str) -> Path:
+    """Shared resolution + existence check. A missing entry point is [Needs-info]."""
+    if not target.lower().endswith(suffixes):
+        raise Refusal("control-3-shape",
+                      f"--run target {target!r} does not end in {' or '.join(suffixes)} "
+                      f"(--lang {lang}).")
+    script = Path(target)
+    if not script.is_absolute():
+        script = (Path.cwd() / script)
+    try:
+        script = script.resolve()
+    except OSError as e:
+        raise Refusal("control-3-shape", f"--run target cannot be resolved: {e}")
+    if not script.is_file():
+        raise Refusal("control-3-shape",
+                      f"--run target does not exist: {script}. A missing entry point is "
+                      "[Needs-info], never an invocation to invent.")
+    return script
+
+
+def check_run_shape_ps1(run_argv: list[str]) -> dict:
+    """Control 3, PowerShell. Interpreter, the EXACT literal prefix, then a resolving .ps1.
+
+    THE PREFIX IS TYPED BY THE CALLER, NEVER INJECTED. prepare_run's token-consistency check
+    compares the caller's tokens against what will be spawned; injecting flags here would make
+    that check disagree with `spawned` for a reason unrelated to any defect, which is precisely
+    the drift the comment in prepare_run exists to prevent.
+    """
+    exe = run_argv[0]
+    if not PS_INTERPRETER_RE.match(Path(exe).name):
+        raise Refusal("control-3-shape",
+                      f"--lang ps1 requires powershell or pwsh; got {exe!r}.")
+    rest = run_argv[1:]
+    if [t for t in rest[:3]] != PS_REQUIRED_PREFIX:
+        raise Refusal("control-3-shape",
+                      f"--lang ps1 requires the exact prefix {' '.join(PS_REQUIRED_PREFIX)} "
+                      f"before the target; got {rest[:3]!r}. -File is what makes this a SCRIPT "
+                      "invocation: -Command would be an inline-code channel, which this wrapper "
+                      "refuses to become.")
+    rest = rest[3:]
+    if not rest:
+        raise Refusal("control-3-shape", "--run names an interpreter and prefix but no target.")
+    script = _resolve_target(rest[0], (".ps1",), "ps1")
+    assert_sandboxed(script, "ps1")
+    return {"kind": "script", "module": None, "flags": list(PS_REQUIRED_PREFIX), "script": script,
+            "cwd": script.parent, "args": rest[1:], "target_token": rest[0], "lang": "ps1"}
+
+
+def check_run_shape_sh(run_argv: list[str]) -> dict:
+    """Control 3, shell. `bash|sh`, NO flags at all, then a resolving .sh/.bash.
+
+    No flags is deliberate rather than lazy: `-c` is an inline-code channel and there is no
+    interpreter flag this wrapper needs, so the smallest grammar that works is the right one.
+    """
+    exe = run_argv[0]
+    if not SH_INTERPRETER_RE.match(Path(exe).name):
+        raise Refusal("control-3-shape", f"--lang sh requires bash or sh; got {exe!r}.")
+    rest = run_argv[1:]
+    if not rest:
+        raise Refusal("control-3-shape", "--run names an interpreter but no target.")
+    if rest[0].startswith("-"):
+        raise Refusal("control-3-shape",
+                      f"--lang sh permits NO interpreter flags; got {rest[0]!r}. `-c` in "
+                      "particular is an inline-code channel.")
+    script = _resolve_target(rest[0], (".sh", ".bash"), "sh")
+    assert_sandboxed(script, "sh")
+    return {"kind": "script", "module": None, "flags": [], "script": script,
+            "cwd": script.parent, "args": rest[1:], "target_token": rest[0], "lang": "sh"}
+
+
+def check_run_shape(run_argv: list[str], lang: str = "py") -> dict:
+    """Control 3. Dispatches by EXPLICIT language; `py` is unchanged byte-for-byte."""
     if not run_argv:
         raise Refusal("control-3-shape", "--run was given no command.")
+    if lang == "ps1":
+        return check_run_shape_ps1(run_argv)
+    if lang == "sh":
+        return check_run_shape_sh(run_argv)
+    return _check_run_shape_py(run_argv)
 
+
+def _check_run_shape_py(run_argv: list[str]) -> dict:
+    """Control 3. argv[0] a Python interpreter, argv[1] a .py path or -m <allowlisted>."""
     exe = run_argv[0]
     if not INTERPRETER_RE.match(Path(exe).name):
         raise Refusal("control-3-shape",
@@ -335,7 +489,7 @@ def check_run_shape(run_argv: list[str]) -> dict:
         # again downstream -- a double slice here silently dropped the first argument and
         # showed the guard a command that was not the one about to run. Measured, fixed.
         return {"kind": "module", "module": module, "flags": flags, "script": None,
-                "cwd": Path.cwd(), "args": rest[2:], "target_token": None}
+                "cwd": Path.cwd(), "args": rest[2:], "target_token": None, "lang": "py"}
 
     target = rest[0]
     if not target.lower().endswith(".py"):
@@ -353,7 +507,7 @@ def check_run_shape(run_argv: list[str]) -> dict:
                       f"--run target does not exist: {script}. A missing entry point is "
                       "[Needs-info], never an invocation to invent.")
     return {"kind": "script", "module": None, "flags": flags, "script": script,
-            "cwd": script.parent, "args": rest[1:], "target_token": target}
+            "cwd": script.parent, "args": rest[1:], "target_token": target, "lang": "py"}
 
 
 def guard_command_string(shape: dict) -> str:
@@ -373,7 +527,7 @@ def guard_command_string(shape: dict) -> str:
     quoting untouched (so a bare `foo.py` operand stays bare, which the guard's
     `\\S+\\.py` rule requires) and quotes only the ones that do.
     """
-    return shlex.join(local_argv(shape, "python"))
+    return shlex.join(local_argv(shape, GUARD_INTERPRETER.get(shape.get("lang", "py"), "python")))
 
 
 def reapply_guard(command: str) -> None:
@@ -397,9 +551,9 @@ def reapply_guard(command: str) -> None:
                       guard_stderr=(proc.stderr or "").strip())
 
 
-def prepare_run(run_argv: list[str]) -> dict:
+def prepare_run(run_argv: list[str], lang: str = "py") -> dict:
     """Controls 1, 2 and 3 in the one place, so no mode can skip one."""
-    shape = check_run_shape(run_argv)
+    shape = check_run_shape(run_argv, lang)
     cmd = guard_command_string(shape)
 
     # The guard must be shown EVERY token that will be spawned. If a caller token is
@@ -411,7 +565,7 @@ def prepare_run(run_argv: list[str]) -> dict:
     # The ONE documented rewrite is the target path -> its basename (see the module
     # docstring: the guard's allowlist cannot match a quoted path containing spaces, and
     # nearly every path in this tree has them). Nothing else may change.
-    spawned = local_argv(shape, "python")
+    spawned = local_argv(shape, GUARD_INTERPRETER.get(shape.get("lang", "py"), "python"))
     for token in run_argv[1:]:
         if token and token != shape.get("target_token") and token not in spawned:
             raise Refusal("control-2-guard",
@@ -430,15 +584,44 @@ def prepare_run(run_argv: list[str]) -> dict:
 
 
 def local_argv(shape: dict, interpreter: str) -> list[str]:
-    """The argv actually spawned, in basename-from-its-own-directory form.
+    """The argv actually spawned. The single source of truth for "what will run".
 
-    The single source of truth for "what will run". guard_command_string() is built from
-    this, and every mode spawns this (or a WSL translation of it).
+    guard_command_string() is built from this, and every mode spawns this (or a WSL
+    translation of it), so the judged command and the run command cannot drift.
+
+    PYTHON USES THE BASENAME, run from the script's own directory -- see the module docstring:
+    the guard's allowlist cannot match a quoted path containing spaces, and nearly every path in
+    this tree has them.
+
+    PS1 AND SH KEEP THE FULL PATH, deliberately differing. Those two EXECUTE the target, so they
+    are Tier 2 and must be confined to a temp sandbox -- and a location rule the guard cannot see
+    is a location rule the guard cannot enforce. Handing it the full path lets it check
+    containment as well, instead of trusting this wrapper alone. assert_sandboxed() is still the
+    authoritative check; this just stops the guard being structurally blind to the question.
+    The cost is that a sandbox path containing spaces will not match the guard's `\\S+` row, so
+    stage sandboxes somewhere space-free.
     """
     argv = [interpreter] + shape["flags"]
     if shape["kind"] == "module":
         return argv + ["-m", shape["module"]] + shape["args"]
+    if shape.get("lang") in ("ps1", "sh"):
+        return argv + [str(shape["script"])] + shape["args"]
     return argv + [shape["script"].name] + shape["args"]
+
+
+# The name shown to the guard, per language. Generic on purpose: the guard judges a SPELLING, and
+# an absolute interpreter path would differ between machines while meaning the same thing.
+GUARD_INTERPRETER = {"py": "python", "ps1": "pwsh", "sh": "bash"}
+
+
+def resolve_interpreter(shape: dict) -> str:
+    """The executable actually spawned for this language."""
+    lang = shape.get("lang", "py")
+    if lang == "py":
+        return sys.executable
+    if lang == "ps1":
+        return shutil.which("pwsh") or shutil.which("powershell") or "powershell.exe"
+    return shutil.which("bash") or "bash"
 
 
 # ---------------------------------------------------------------------------- WSL gate
@@ -819,7 +1002,7 @@ def mode_profile(args, shape) -> int:
             "finding": "the workload did not finish inside the timeout. That is itself a "
                        "finding -- report it as one, do not raise the timeout silently.",
             "guard_command": shape["guard_command"],
-        }, disclosures=NOISE_DISCLOSURE)
+        }, disclosures=NOISE_DISCLOSURE + lang_disclosures(shape))
     wall = time.perf_counter() - t0
 
     if not out_prof.is_file():
@@ -841,7 +1024,7 @@ def mode_profile(args, shape) -> int:
         "top_allocations": data["top_allocations"],
         "stdout_tail": (proc.stdout or "")[-500:],
         "stderr_tail": (proc.stderr or "")[-500:],
-    }, disclosures=NOISE_DISCLOSURE, notes=[
+    }, disclosures=NOISE_DISCLOSURE + lang_disclosures(shape), notes=[
         "cProfile attributes by FUNCTION, not by line. For line-level attribution use "
         "--mode scalene (WSL).",
         "tracemalloc counts Python-level allocations only; C-extension arenas (numpy) are "
@@ -866,7 +1049,7 @@ def mode_scalene(args, shape) -> int:
         return emit("scalene", True, {
             "timed_out": True, "timeout_s": args.timeout,
             "finding": "the workload did not finish inside the timeout; that is a finding.",
-        }, disclosures=NOISE_DISCLOSURE)
+        }, disclosures=NOISE_DISCLOSURE + lang_disclosures(shape))
 
     got = wsl_run(["cat", out_json], timeout=120)
     raw = got.stdout or ""
@@ -915,7 +1098,7 @@ def mode_scalene(args, shape) -> int:
         "imports_checked": pre["imports_checked"],
         "exit_code": r.returncode,
         "stdout_tail": (r.stdout or "")[-400:],
-    }, disclosures=NOISE_DISCLOSURE, notes=[
+    }, disclosures=NOISE_DISCLOSURE + lang_disclosures(shape), notes=[
         memory_note,
         "Use n_peak_mb, never n_growth_mb.",
         "MEASURED 2026-08-17: in Scalene 2.3.0 `cpu_samples_list` comes back EMPTY even on "
@@ -961,7 +1144,7 @@ def mode_memray(args, shape) -> int:
         "allocator_type_distribution": d.get("allocator_type_distribution"),
         "imports_checked": pre["imports_checked"],
         "exit_code": run.returncode,
-    }, disclosures=NOISE_DISCLOSURE, notes=[
+    }, disclosures=NOISE_DISCLOSURE + lang_disclosures(shape), notes=[
         "peak_memory is the allocator's peak RSS, which INCLUDES C-extension arenas that "
         "tracemalloc cannot see.",
         "This ran under Linux; Windows allocator behaviour differs.",
@@ -987,7 +1170,7 @@ def mode_sample(args, shape) -> int:
             "method": "py-spy dump (attached, zero instrumentation overhead)",
             "pid": args.pid,
             "threads": json.loads(r.stdout) if r.stdout.strip().startswith("[") else r.stdout,
-        }, disclosures=NOISE_DISCLOSURE)
+        }, disclosures=NOISE_DISCLOSURE + lang_disclosures(shape))
 
     if shape is None:
         raise Refusal("mode-sample", "--mode sample needs either --pid or --run.")
@@ -1024,7 +1207,7 @@ def mode_sample(args, shape) -> int:
             "samples": n, "percent": 100.0 * n / total,
         } for i, n in top],
         "speedscope_file": str(out),
-    }, disclosures=NOISE_DISCLOSURE, notes=[
+    }, disclosures=NOISE_DISCLOSURE + lang_disclosures(shape), notes=[
         "Sampling attributes to the LEAF frame; a hot caller with cheap leaves will not "
         "appear here. Cross-read with --mode profile before naming a hot path.",
     ])
@@ -1066,7 +1249,7 @@ def mode_bench(args, shape) -> int:
     # measurement has to reproduce.
     argv = [sys.executable, "-m", "pyperf", "command", "--copy-env",
             "--processes", str(args.processes), "--values", str(args.values),
-            "-o", str(out), "--"] + local_argv(shape, sys.executable)
+            "-o", str(out), "--"] + local_argv(shape, resolve_interpreter(shape))
     try:
         r = subprocess.run(argv, cwd=str(shape["cwd"]), capture_output=True, text=True,
                            timeout=args.timeout, env=env, errors="replace")
@@ -1102,7 +1285,7 @@ def mode_bench(args, shape) -> int:
         "spread_pct": (100.0 * (max(values) - min(values)) / min(values)) if min(values) else None,
         "pyperf_json": str(out),
         "stdout_tail": (r.stdout or "")[-400:],
-    }, disclosures=NOISE_DISCLOSURE, notes=[
+    }, disclosures=NOISE_DISCLOSURE + lang_disclosures(shape), notes=[
         "Quote MIN-of-N, not the mean: the minimum is the least-perturbed sample.",
         "Sub-10% deltas are not reportable (Georges/Buytaert/Eeckhout, OOPSLA 2007). "
         "The reportable bar on this host is 20%, because Windows offers no CPU isolation.",
@@ -1112,7 +1295,7 @@ def mode_bench(args, shape) -> int:
 
 
 def _run_workload_once(shape, timeout: int) -> dict:
-    argv = local_argv(shape, sys.executable)
+    argv = local_argv(shape, resolve_interpreter(shape))
     try:
         p = subprocess.run(argv, cwd=str(shape["cwd"]), capture_output=True, text=True,
                            timeout=timeout, errors="replace")
@@ -1148,7 +1331,7 @@ def mode_energy(args, shape) -> int:
     gate = _energy_measure(args, shape)
     gate["guard_command"] = shape["guard_command"]
     return emit("energy", gate["resolvable"] or True, gate,
-                disclosures=NOISE_DISCLOSURE + [ENERGY_DISCLOSURE], notes=[
+                disclosures=NOISE_DISCLOSURE + [ENERGY_DISCLOSURE] + lang_disclosures(shape), notes=[
         "Never import pyRAPL: it is installed, advertises this capability, and raises "
         "FileNotFoundError('/sys/devices/system/cpu/present') on Windows.",
         "Never look for /sys/class/powercap under WSL -- measured empty three times.",
@@ -1166,7 +1349,7 @@ def mode_sci(args, shape) -> int:
             "reason": gate["statement"],
             "why": gate.get("why"),
             "energy": gate,
-        }, disclosures=NOISE_DISCLOSURE + [ENERGY_DISCLOSURE], notes=[
+        }, disclosures=NOISE_DISCLOSURE + [ENERGY_DISCLOSURE] + lang_disclosures(shape), notes=[
             "E was not resolvable above the idle floor, so no SCI figure is computed. "
             "Modelling E instead of measuring it is forbidden."])
 
@@ -1179,7 +1362,7 @@ def mode_sci(args, shape) -> int:
                       "so a sub-second workload cannot be expressed as an SCI figure. "
                       "Give it more work rather than inflating the number.",
             "energy": gate,
-        }, disclosures=NOISE_DISCLOSURE + [ENERGY_DISCLOSURE])
+        }, disclosures=NOISE_DISCLOSURE + [ENERGY_DISCLOSURE] + lang_disclosures(shape))
 
     energy_kwh = float(gate["attributed_energy_kwh_median"])
     r_value = float(args.functional_unit_value)
@@ -1217,7 +1400,7 @@ def mode_sci(args, shape) -> int:
         "vic_vs_aus_gap_pct": gap,
         "energy": gate,
         "guard_command": shape["guard_command"],
-    }, disclosures=NOISE_DISCLOSURE + [ENERGY_DISCLOSURE], notes=[
+    }, disclosures=NOISE_DISCLOSURE + [ENERGY_DISCLOSURE] + lang_disclosures(shape), notes=[
         f"Every SCI number here is {SCI_NONCONFORMANCE}.",
         "SciEmbodied is deliberately not used: its baseline is a cloud server, not this "
         "laptop.",
@@ -1457,6 +1640,10 @@ def build_parser() -> argparse.ArgumentParser:
         description="Read-only measurement instrument for the SQA suite. "
                     "Emits exactly one JSON object on stdout.")
     p.add_argument("--mode", required=True, choices=MODES)
+    p.add_argument("--lang", choices=LANGS, default="py",
+                   help="language of the --run target. Gated on this EXPLICIT flag, never on "
+                        "sniffing argv, so the JSON can report which shape check ran and "
+                        "--lang py stays byte-identical to every existing invocation.")
     p.add_argument("--timeout", type=int, default=300,
                    help="seconds; a timeout returns a structured result, not an error")
     p.add_argument("--reps", type=int, default=3,
@@ -1493,9 +1680,22 @@ def main(argv: list[str]) -> int:
         if mode == "prose":
             return mode_prose(args)
 
+        # CPython-only modes. profile is cProfile+tracemalloc, scalene and memray instrument the
+        # CPython allocator, and sample attaches py-spy to a Python process -- none of them have
+        # any meaning for a .ps1 or a .sh, and pretending otherwise would produce a confident
+        # number about the wrong process. `bench` is the widening that matters: pyperf's
+        # `command` sub-command benchmarks an ARBITRARY external command, so the only Python
+        # coupling was local_argv(). energy and sci then follow for free, because they consume
+        # only a duration and a joule count.
+        if args.lang != "py" and mode in ("profile", "scalene", "memray", "sample"):
+            raise Refusal(f"mode-{mode}",
+                          f"--mode {mode} is CPython-only and cannot measure a --lang "
+                          f"{args.lang} target. Use --mode bench for wall-time (pyperf "
+                          "benchmarks an arbitrary external command), or --mode energy/sci.")
+
         shape = None
         if run_argv:
-            shape = prepare_run(run_argv)
+            shape = prepare_run(run_argv, args.lang)
         elif mode in NEEDS_RUN:
             raise Refusal("no-run-command",
                           f"--mode {mode} needs a workload: pass `--run python <target>.py "

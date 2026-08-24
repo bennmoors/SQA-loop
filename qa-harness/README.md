@@ -9,7 +9,7 @@ observed behaviour in current coding agents, not a hypothetical.
 
 ---
 
-## The eight files
+## The nine files
 
 | File | Kind | Target |
 |---|---|---|
@@ -18,6 +18,7 @@ observed behaviour in current coding agents, not a hypothetical.
 | `mutate.py` | **metric** | either, via a checker |
 | `guard_corpus.py` | **gate** | `sqa-guard-bash.ps1` behaviour |
 | `scope_corpus.py` | **gate** | `fixer-scope-guard.ps1` behaviour |
+| `run_shape_corpus.py` | **gate** | `perf_probe.check_run_shape()` — the `--lang` dispatch |
 | `adversarial_probe.py` | *diagnostic only* | `sqa-guard-bash.ps1` |
 | `_wiring.py` | helper | shared by both corpora |
 | `README.md` | this | — |
@@ -128,6 +129,35 @@ Both corpora once carried duplicate wiring extraction with identical Critical de
 
 If you build your own harness, test it the same way: point it at a stub that always exits 0 and
 confirm the score collapses.
+
+### `run_shape_corpus.py`
+
+```
+python run_shape_corpus.py [--probe <perf_probe.py>] [--quiet|--score|--gate|--json]
+```
+
+Two-sided corpus for `perf_probe.check_run_shape()` — 30 cases, must-accept and must-refuse, fed to
+the function **directly with no subprocess**, so the whole run is well under a second.
+
+It exists because `perf_probe.py` had **no dedicated test at all**. Its correctness was asserted
+only indirectly, through `guard_corpus` reaching it via `reapply_guard` — which tests the *guard*,
+not the shape check. That was survivable while `check_run_shape` was one function with one language
+in it, and stopped being survivable the moment it became a three-way `--lang` dispatch: a
+per-language dispatch is exactly the shape where one branch silently loses a check while every other
+branch keeps passing. The `py` branch is the one to watch, because it is supposed to be
+byte-for-byte unchanged and a corpus is the only thing that can say so after the next edit.
+
+It covers the two Tier 2 rules the guard cannot see — `ps1`/`sh` targets must resolve inside a temp
+sandbox, and inline-code channels (`-Command`, `-EncodedCommand`, `bash -c`, any `sh` interpreter
+flag) stay refused — plus the ordinary shape rules for all three languages.
+
+Sanity-check it the same way as the other corpora: point `--probe` at a stub whose
+`check_run_shape` accepts everything. Measured 2026-08-24 — real `perf_probe` **30/30 (100.0%)**,
+permissive stub **12/30 (40.0%)**, `--score` 100.0 → 33.3, `--gate` PASS → FAIL. A missing or
+unimportable target reports UNUSABLE and exits 2 rather than passing vacuously.
+
+**It is not wired into `install.ps1 -Verify`**, which still runs three gates. Adding it is a
+one-line change; it was left out because the installer's gate count is user-visible output.
 
 ---
 

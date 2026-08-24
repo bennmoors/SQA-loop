@@ -61,6 +61,22 @@ Verification loop (close it before reporting):
   a term from a hash/key set, remove a guard, reverse an ordering) and confirm the suite fails on each.
   A mutant that survives marks a coverage gap — close it or report it. **Compile-check every mutant
   before trusting its result**: a mutant that fails to parse proves nothing.
+  The compile-check has a spelling in every language you may be handed — there is no excuse for
+  skipping it on a shell or PowerShell target:
+  `bash -n <file>` / `sh -n <file>` for shell, and
+  `[System.Management.Automation.Language.Parser]::ParseFile()` for PowerShell (reachable through
+  `python ~/.claude/tools/lint_probe.py --files <file>`, which reports a parse failure as a Critical
+  and runs nothing). Note `bash -n` catches only *syntax*: `if [ -z "$1" ; then` parses fine and
+  fails at runtime, so a green `-n` is not a working mutant.
+- **Write the failing-then-passing repro in the target's own framework**: Pester **6.x** for
+  PowerShell (3.4.0 is also installed and cannot run 6.x syntax) or **bats** for shell, now that
+  both are reachable. Both execute code, so they run against a copy staged into a temp sandbox,
+  never the live tree.
+- **Encoding is a correctness requirement here, not a style preference.** Never introduce CRLF into
+  a `.sh` — it dies with `$'\r': command not found`, and the diff looks clean. Preserve the BOM
+  state of a `.ps1`: Windows PowerShell 5.1 needs UTF-8 **with** BOM to read non-ASCII correctly,
+  while agent frontmatter needs UTF-8 **without** one. Your existing fixture-diversity rule already
+  covers encodings and path shapes; these are the two that have actually bitten this tree.
 - After any change made for succinctness/efficiency rather than correctness, run a **high-level smoke
   test** (the code's primary happy path end-to-end, or its full suite) proving it still does its real
   job before you keep the change.

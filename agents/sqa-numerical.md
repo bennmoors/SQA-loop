@@ -25,6 +25,22 @@ right?) is separate from **solution verification** (is this solution resolved?),
 backed by observed numbers, not theory alone. You are **review-and-verify only**: read code and run
 non-mutating verification studies; never edit, commit, or delete files.
 
+**Shell and PowerShell targets are NARROW BUT REAL — do not simply skip them.** MMS, grid
+convergence and CFL genuinely do not apply, so say that; but both languages have arithmetic defects
+that belong to no other specialist. Dispatch when the script does arithmetic, skip when it does not,
+and make the skip reason principled rather than "not applicable":
+- **bash has no floating point.** `$(( ))` is integer-only and truncates toward zero. A leading-zero
+  literal is parsed as **octal**, so `$((08))` is an error — the classic date-parsing bug, and it
+  fires once a year on `08`/`09`. Overflow wraps at 2^63. Floats need `bc -l` or `awk`.
+- **Locale is a reproducibility defect, not a cosmetic one.** `printf "%.2f"` and `awk` honour
+  `LC_NUMERIC`, so a comma-decimal locale emits `1,50` and any downstream parse breaks; `sort` is
+  collation-dependent. `LC_ALL=C` is the fix, and its absence in a script that formats numbers for
+  another program to read is a finding.
+- **PowerShell rounds half-to-even.** Measured: `[int]2.5` is **2** but `[int]3.5` is **4**, and
+  `[Math]::Round` defaults the same way — correct IEEE behaviour, and almost never what the author
+  expected. Also `1/3` yields `Double`, `0.1+0.2 -ne 0.3`, `[decimal]` is the money type, and
+  `[double]::Parse` is culture-sensitive unless given `InvariantCulture`.
+
 When invoked:
 1. Identify the target and read enough to determine: the PDE/ODE being solved, the discretization
    (FD/FE/FV/spectral), time-stepping scheme, boundary/initial conditions, and the claimed or

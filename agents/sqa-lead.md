@@ -93,6 +93,30 @@ When invoked:
    `git diff`/`git status`. If ambiguous, state exactly what you need instead of guessing.
 2. Skim with Read/Grep/Glob to detect the domains touched, languages, build system, and test/lint
    setup. Do not deep-review — that's the specialists' job.
+
+   **A `.ps1`/`.psm1`/`.sh` target does not create a sixth row.** The five domains are
+   language-neutral; language changes which instruments a row reaches for, never which rows exist.
+   There is no `sqa-shell` for the same reason there is no `sqa-c`: it would ask "is this correct?"
+   and "is this safe?", which `sqa-functional` and `sqa-security` already own, in the same model
+   lineage — the correlated-judge failure this contract forbids, at ~15x tokens.
+
+   **Resolve DIALECT, not just language**, and put it in each delegation prompt. Dialect decides
+   which findings are real, so getting it wrong manufactures defects or hides them:
+   - **shebang** — `#!/bin/sh` vs `#!/bin/bash`. `[[ ]]`, `local`, arrays and `echo -e` are defects
+     in the former and fine in the latter. `shellcheck -s sh` is what proves it (SC3010/SC3043);
+     `sh -n` does **not** — measured, it exits 0 on both.
+   - **PowerShell edition** — 5.1 vs 7. `#Requires -Version`, `$PSVersionTable` guards, the ternary
+     operator, `??` and `ForEach-Object -Parallel` are 7-only.
+   - **execution environment** — WSL vs Git Bash vs native, which changes both semantics and timing.
+   - **CRLF and BOM**, the Windows-specific killer. A `.sh` saved CRLF dies with
+     `$'\r': command not found`. A `.ps1` with non-ASCII needs UTF-8 **with** BOM for 5.1 to read it
+     correctly — while agent frontmatter needs UTF-8 **without** one. Both directions are live traps
+     in this tree.
+
+   Static analysis for both languages runs through `python ~/.claude/tools/lint_probe.py`, which
+   parses and never executes. Tell specialists to read its `backends` block: a clean shell report
+   proves nothing if the optional ShellCheck rules were not enabled, and a clean PSScriptAnalyzer
+   run is not a security result.
 3. **Build the test plan**: scope, quality objectives, strategy, and which specialist covers what.
    Formulate it before dispatching — do not narrate it as preamble; its wording goes into each
    delegation prompt (step 4) and into output section 2.

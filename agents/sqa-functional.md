@@ -32,6 +32,37 @@ When invoked:
    adversarial matrix (empty, oversized, malformed, duplicate, concurrent, failure-and-recovery);
    property-style invariants ("what must always hold, whatever the input?").
 4. **Verify**: run the existing test suite, linters, type-checkers, and coverage tooling via Bash.
+
+   **On a PowerShell or shell target**, static analysis runs through
+   `python ~/.claude/tools/lint_probe.py --files <paths>` (it parses, never executes). Read the
+   `backends` block before reporting: a clean shell result with no optional rules enabled is clean
+   for the wrong reason. Test execution is Tier 2 — `bats` and `Invoke-Pester` may only run against
+   a copy staged into a temp sandbox, never the live tree.
+
+   **PowerShell — the error model is the dominant bug class, ahead of anything a linter reports.**
+   `$ErrorActionPreference` defaults to `Continue`, so non-terminating errors are silently ignored
+   and execution proceeds with a wrong value. Distinguish `$?` from `$LASTEXITCODE` from `throw`;
+   a native exit code is lost through `& '<path>'` unless `; exit $LASTEXITCODE` follows — the exact
+   defect that left this repo's own Bash guard inert for four weeks. Watch **output-stream
+   pollution**: a function returns *everything* not consumed, so one stray uncaptured expression
+   corrupts the return value. Also: pipeline unrolling collapsing a single-element array to a
+   scalar; `-eq` on an array returning a filtered array rather than a boolean; and `'10' -gt '9'`
+   being **False** (string comparison — measured). Look for `Set-StrictMode -Version Latest`,
+   `[CmdletBinding()]`, `ValidateSet`, and `ShouldProcess`/`-WhatIf` on anything state-changing.
+
+   **Shell — `set -euo pipefail` and its pitfalls.** `-e` does not fire inside `if`/`&&` contexts,
+   nor for a non-final pipeline stage without `pipefail`. `local x=$(cmd)` masks the exit status
+   because `local` is itself a command that succeeds. `while read` in a pipeline loses variables to
+   a subshell. Check `read -r`, `trap` cleanup, `IFS`, and unquoted expansion.
+
+   **Testing.** Pester **6.1.0** is installed alongside the bundled **3.4.0**, which cannot run 6.x
+   syntax — establish which version an existing suite targets before calling anything a defect. v6
+   removed `-Pending`, moved discovery/execution to per-file, and added the type-aware `Should-*`
+   family alongside the still-working v5 `Should -Be`. Coverage is real in v6: faster by default,
+   plus Cobertura output, so a PowerShell target can get actual coverage numbers rather than "no
+   coverage tooling". `bats-core` (`run`, `$status`, `$output`) covers shell; it is **WSL-only**
+   here. On most `.ps1` targets there will be no suite at all, and **a missing entry point is
+   `[Needs-info]`, never an invocation to invent** — saying so is the correct report.
    Then probe the suite itself with mutation thinking — for each key behavior ask "if I seeded a
    plausible bug here (off-by-one, inverted condition, swallowed error), would these tests catch
    it?" Report the survivors as coverage gaps. Describe missing tests; do not write them.

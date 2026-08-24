@@ -182,6 +182,13 @@ $maskedCmd = $maskedAll.ToString()
 # it would be the same bypass here.
 $tempArg = '(?:[A-Za-z]:)?[\\/]?(?:[^\s;|&]*[\\/])?(?:temp|tmp)[\\/][^\s;|&]*'
 
+# The same shape, but tolerating the SINGLE QUOTES shlex.join adds. perf_probe derives the string
+# it shows this guard with shlex.join, which quotes any token containing a backslash -- and
+# Path.resolve() always produces backslashes on Windows. An unquoted-only pattern would refuse
+# every real `--lang ps1|sh` invocation. Stops at a quote or whitespace rather than at `;|&`,
+# because inside the quotes those are literal.
+$qTempPath = "'?(?:[A-Za-z]:)?[\\/](?:[^\s']*[\\/])?(?:temp|tmp)[\\/][^\s']*"
+
 # The PARAMETERS Invoke-ScriptAnalyzer may receive. A POSITIVE allowlist, and it has to be:
 # PowerShell binds any unambiguous parameter PREFIX, so `-F`, `-Fi` and `-Fix` all reach -Fix
 # (measured 2026-08-24; `-Zzz` is rejected, so the probe discriminates). A negative match on the
@@ -359,6 +366,33 @@ $allowed = @(
     # other `cp`. The case that makes this non-obvious is `cp /tmp/evil.psm1 hooks/guard.ps1` --
     # SOURCE in temp, destination in the repo -- which a naive "mentions temp" check would allow.
     ("(?!.*\.\.)cp\s+(?:-[rRpa]+\s+)*[^\s;|&-][^\s;|&]*\s+" + $tempArg + '\s*'),
+
+    # --- PERF_PROBE's DERIVED COMMANDS, Tier 2. These are what `perf_probe.py --lang ps1|sh`
+    # submits to this guard from inside itself (control 2), so they must land here or that mode
+    # always fails at control-2 no matter how correct the wrapper is. They are also typeable
+    # directly by an agent, which is the honest way to read them: this row IS the widening, and
+    # perf_probe merely uses it.
+    #
+    # THE PATH IS QUOTED. shlex.join quotes any token containing a backslash, and Path.resolve()
+    # always yields backslashes on Windows -- so the string this guard actually sees is
+    # `pwsh -NoProfile -NonInteractive -File 'C:\...\Temp\sqa-a1\probe.ps1'`. Measured, not
+    # assumed; an unquoted-only row would have refused every real invocation.
+    #
+    # SANDBOX-CONSTRAINED like the other Tier 2 rows. perf_probe asserts the same thing
+    # internally in assert_sandboxed(), which is the authoritative check because it holds the
+    # resolved absolute path; this row exists so the guard is not structurally blind to the
+    # question. Note the contrast with `--lang py`, where local_argv() rewrites the target to its
+    # BASENAME and no location rule is expressible here at all.
+    #
+    # RESIDUAL RISK, stated plainly: after this row a `.ps1` or `.sh` staged into temp is
+    # arbitrary code, and it runs with the user's full privileges. Three things make it
+    # defensible rather than a new class of hole -- the guard still judges the spelling; the
+    # allowlist already accepts "run the target's own code" for `python foo.py` and `pytest`, so
+    # this is the same accepted risk in new syntax; and the line that does NOT move is INLINE
+    # code: `-Command`, `-EncodedCommand`, `bash -c`, here-docs and `$(...)` all stay refused.
+    # That is a shape, not a list of dangerous verbs, which is why it survives a novel spelling.
+    ("(?!.*\.\.)(?:powershell|pwsh)(?:\.exe)?\s+-NoProfile\s+-NonInteractive\s+-File\s+" + $qTempPath + "\.ps1'?(?:\s+.*)?"),
+    ("(?!.*\.\.)(?:bash|sh)\s+" + $qTempPath + "\.(?:sh|bash)'?(?:\s+.*)?"),
 
     # --- PowerShell read-only cmdlets
     '(?:Get-Content|Select-String|Get-ChildItem|Get-Item|Test-Path|Measure-Object|Get-Command|Get-Help|Compare-Object|ConvertFrom-Json|Select-Object|Where-Object|ForEach-Object|Sort-Object|Format-List|Format-Table|Out-String|Write-Output|Write-Host)\b.*'
