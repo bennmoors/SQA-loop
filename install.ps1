@@ -190,7 +190,7 @@ function Invoke-Gates {
     if ($LASTEXITCODE -eq 0) {
         Write-Ok 'every case behaved as required'
     } elseif ($LASTEXITCODE -eq 1) {
-        # Known state as of 2026-08-24: 47/51, FOUR must-block cases fail. They are documented
+        # Known state as of 2026-08-24: 53/57, FOUR must-block cases fail. They are documented
         # bypasses of fixer-scope-guard.ps1 (interpreter write, perl -pi, git checkout,
         # cd-then-relative-redirect), not a broken install. Reported, never hidden.
         #
@@ -199,7 +199,7 @@ function Invoke-Gates {
         # stood for (Set-Content/Out-File/New-Item/Add-Content, positional and named-parameter
         # forms alike). A stale "known gap" note is the exact failure R3 names: correct when
         # written, silently false later, and reassuring in both states.
-        Write-Warn "47/51 expected -- four must-block cases are known-failing UPSTREAM, not an"
+        Write-Warn "53/57 expected -- four must-block cases are known-failing UPSTREAM, not an"
         Write-Warn "install fault: interpreter write, perl -pi, git checkout, and"
         Write-Warn "cd-then-relative-redirect. Read docs/GUARDS.md 'Known gaps' before relying"
         Write-Warn "on the fixer boundary. The Edit/Write path is unaffected."

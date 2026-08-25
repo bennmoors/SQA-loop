@@ -128,34 +128,79 @@ if ($cmd) {
     #      discards every token starting with `-`. A named-parameter value was only ever reachable
     #      positionally, so writing `-Path` was by itself enough to defeat it.
     #
-    # A read-only searcher is exempted BY HEAD: `grep -rn "Set-Content" ~/.claude/qa-harness/`
-    # names both a protected path and a cmdlet while writing nothing, and reviewing PowerShell is
-    # precisely the work that generates that command. Refusing it teaches routing around the guard.
+    # ANCHORED AT COMMAND POSITION, not exempted by command head. The first version skipped the
+    # whole extractor whenever `$cmd` STARTED with a searcher, which meant one leading `grep`
+    # disabled it for every later segment -- measured:
+    #   Set-Content -Path <protected> 'x'                 -> BLOCK  (correct)
+    #   grep -rn x . ; Set-Content -Path <protected> 'x'   -> ALLOW  (the whole pass was skipped)
+    # Anchoring instead means a cmdlet name inside a search PATTERN never matches (the character
+    # before it is a quote, which is not a command position), while a real invocation after a
+    # separator does. Same `$CP` idiom the sibling guard uses, plus the nested-shell case:
+    # `powershell -c "Set-Content ..."` puts the cmdlet immediately inside the payload quote.
+    $psCP = '(?:^|[;|&(`\n]|\$\(|-(?:c|Command)\s+["''])\s*'
+
+    # NAMES ARE NOT THE CLASS, and matching them literally is the defect this suite already
+    # rejected for `rm`. Three spellings reached protected paths past the first version:
+    #   sc -Path <protected> 'x'                     -- the built-in ALIAS for Set-Content
+    #   [IO.File]::WriteAllText('<protected>','p')   -- a .NET static, no cmdlet involved
+    #   Set-Content -Pat:<protected> 'x'             -- PowerShell binds any unambiguous PREFIX
+    # All three now covered: aliases are listed, .NET statics get their own pass below, and
+    # parameter names are matched by PREFIX rather than by exact spelling.
     $psWriters = 'Set-Content|Out-File|Add-Content|New-Item|Clear-Content|Remove-Item|' +
                  'Rename-Item|Move-Item|Copy-Item|Set-ItemProperty|New-ItemProperty|' +
-                 'Tee-Object|Export-Csv|Export-Clixml|Set-Acl'
-    $psTargetParams = 'Path|LiteralPath|FilePath|Destination|OutFile|Target|NewName'
-    $searcherHead = '^\s*(?:grep|egrep|fgrep|rg|ag|ack|findstr|Select-String)\b'
+                 'Tee-Object|Export-Csv|Export-Clixml|Export-CliXml|Set-Acl|Set-Item|' +
+                 'Start-Transcript|Out-Csv|ConvertTo-Json|Export-ModuleMember|' +
+                 # built-in aliases for the above, which are what a terse writer actually types
+                 'sc|ni|ri|ac|clc|cpi|mi|move|rni|si|sp|epcsv|oh|rd|del|erase|md'
+    # Matched by PREFIX: PowerShell accepts any unambiguous abbreviation, so `-Pat`, `-Li` and
+    # `-Dest` all bind. Over-collecting a token is free -- only a PROTECTED path triggers a Deny.
+    $psTargetParams = @('Path', 'LiteralPath', 'FilePath', 'Destination', 'DestinationPath',
+                        'OutFile', 'Target', 'NewName', 'ItemType', 'Value')
 
-    if ($cmd -notmatch $searcherHead) {
-        foreach ($m in [regex]::Matches($cmd, "\b(?:$psWriters)\b(?<args>[^;|&]*)",
-                                        [Text.RegularExpressions.RegexOptions]::IgnoreCase)) {
-            $toks = @($m.Groups['args'].Value -split '\s+' | Where-Object { $_ })
-            for ($j = 0; $j -lt $toks.Count; $j++) {
-                $tok = $toks[$j]
-                if ($tok -imatch "^-(?:$psTargetParams)$") {
-                    # Named parameter: the target is the NEXT token, not this one.
-                    if ($j + 1 -lt $toks.Count) { $targets.Add($toks[$j + 1].Trim('"', "'")) }
-                } elseif ($tok -imatch "^-(?:$psTargetParams):(?<v>.+)$") {
-                    # `-Path:value` colon form binds with no space between name and value.
-                    $targets.Add($Matches['v'].Trim('"', "'"))
-                } elseif ($tok -notmatch '^-') {
-                    # Positional: `Set-Content <path> <value>` binds -Path positionally. Collecting
-                    # the value token too is harmless -- only a PROTECTED path can trigger a Deny.
-                    $targets.Add($tok.Trim('"', "'"))
-                }
+    function Test-TargetParam([string]$tok) {
+        # Returns the inline value for `-Name:value`, '' for a bare `-Name`, or $null if this
+        # token is not an abbreviation of any target parameter.
+        if ($tok -notmatch '^-{1,2}([A-Za-z]+)(?::(.*))?$') { return $null }
+        $name = $Matches[1]
+        $inline = $Matches[2]
+        foreach ($p in $psTargetParams) {
+            if ($p.StartsWith($name, [System.StringComparison]::OrdinalIgnoreCase)) {
+                if ($null -eq $inline) { return '' }
+                return $inline
             }
         }
+        return $null
+    }
+
+    foreach ($m in [regex]::Matches($cmd, "$psCP(?:$psWriters)\b(?<args>[^;|&]*)",
+                                    [Text.RegularExpressions.RegexOptions]::IgnoreCase)) {
+        $toks = @($m.Groups['args'].Value -split '\s+' | Where-Object { $_ })
+        for ($j = 0; $j -lt $toks.Count; $j++) {
+            $tok = $toks[$j]
+            $tp = Test-TargetParam $tok
+            if ($null -ne $tp) {
+                if ($tp -ne '') {
+                    $targets.Add($tp.Trim('"', "'"))          # -Path:value
+                } elseif ($j + 1 -lt $toks.Count) {
+                    $targets.Add($toks[$j + 1].Trim('"', "'")) # -Path value
+                }
+            } elseif ($tok -notmatch '^-') {
+                # Positional: `Set-Content <path> <value>` binds -Path positionally. Collecting
+                # the value token too is harmless -- only a PROTECTED path can trigger a Deny.
+                $targets.Add($tok.Trim('"', "'"))
+            }
+        }
+    }
+
+    # .NET STATIC WRITERS. No cmdlet name appears at all, so every pass above is blind to them.
+    # `[IO.File]::WriteAllText('<protected>', 'payload')` is one expression and needs no shell
+    # verb. Matched on the method name, with the first quoted argument taken as the target.
+    $netWriters = 'WriteAllText|WriteAllLines|WriteAllBytes|AppendAllText|AppendAllLines|' +
+                  'Create|CreateText|Copy|Move|Delete|Replace|CreateDirectory|SetAttributes'
+    foreach ($m in [regex]::Matches($cmd,
+            "\[(?:System\.)?IO\.(?:File|Directory|FileInfo|DirectoryInfo)\]::(?:$netWriters)\s*\(\s*(?<t>[^,)]+)",
+            [Text.RegularExpressions.RegexOptions]::IgnoreCase)) {
+        $targets.Add($m.Groups['t'].Value.Trim().Trim('"', "'"))
     }
 
     foreach ($t in $targets) {

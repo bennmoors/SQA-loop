@@ -503,6 +503,57 @@ CASES = [
     ("perf-ps1-chained", BLOCK,
      r"pwsh -NoProfile -NonInteractive -File 'C:\Users\example\AppData\Local\Temp\a\w.ps1' && rm -rf build/",
      "must not become a chaining vector"),
+
+    # ------------------------------------------- COMPOSED EVASIONS, 2026-08-24 (SQA round 1)
+    # THE HEADLINE LESSON OF THAT ROUND: this corpus scored 162/162 while five bypasses walked
+    # through the guard. Every evasion family was present as a SINGLE case and none was ever
+    # COMPOSED with another, so the score measured the author's imagination exactly as the file
+    # header warns. `evade-comment-suffix` and `evade-newline-chain` had both existed for weeks;
+    # putting them in one command defeats the guard, and nothing tested that.
+    ("evade-comment-then-newline", BLOCK, "ls # note\ncd /",
+     "COMPOSED: comment + newline chain. The comment scan stopped ON the newline and the for-loop "
+     "then stepped PAST it, so the newline never acted as a separator and both lines fused into "
+     "one segment that `(?:ls|dir)\\s*.*` absorbed. Measured ALLOW on the ORIGINAL guard too"),
+    ("evade-comment-then-newline-git", BLOCK, "git status # x\nchmod +x deploy.sh",
+     "same composition, different second verb, so the case is not pinned to `cd`"),
+    ("allow-comment-suffix-plain", ALLOW, "git status # a note about rm -rf",
+     "must-allow mate: a comment is still stripped, not matched. Fixing the composition above "
+     "must not turn every trailing comment into a refusal"),
+    ("evade-backslash-quote", BLOCK, 'grep -rn "a\\"b" README.md ; cd /',
+     "COMPOSED: a backslash-escaped quote desyncs the tokeniser's quote parity from bash, so the "
+     "`;` stops splitting and the second command rides along. Differs from the allowed form by "
+     "exactly one backslash. Measured ALLOW on the original guard"),
+    ("allow-backslash-in-pattern", ALLOW, r'grep -rn "a\"b" README.md',
+     "must-allow mate: the same escaped quote in a legitimate search must still pass"),
+    ("allow-windows-path-unquoted", ALLOW, r"cat C:\Users\example\notes.txt",
+     "must-allow mate for the escape handling: an unquoted Windows path is full of backslashes "
+     "and must not be mangled into a refusal"),
+    ("hyperfine-payload-command", BLOCK, "hyperfine 'pwsh -Command Get-Date'",
+     "the payload grammar admitted FLAGS, so -Command re-opened arbitrary execution through the "
+     "one row whose purpose was to close it. Same class as -Fix: a character denylist cannot see "
+     "that a flag is a channel"),
+    ("hyperfine-payload-dash-c", BLOCK, "hyperfine 'bash -c whoami'",
+     "the shell spelling of the same hole"),
+    ("hyperfine-payload-file", ALLOW,
+     "hyperfine 'pwsh -NoProfile -NonInteractive -File bench.ps1'",
+     "must-allow mate: benchmarking PowerShell properly needs -NoProfile/-NonInteractive/-File, "
+     "so the fix allowlists those positively rather than banning every flag"),
+    ("pssa-settings-arbitrary", BLOCK,
+     "pwsh -NoProfile -NonInteractive -Command Invoke-ScriptAnalyzer -Path x.ps1 -Settings /tmp/e.psd1",
+     "a PSSA settings .psd1 carries its own CustomRulePath key, so -Settings loads arbitrary rule "
+     "modules and runs their top-level code -- it defeats the pinned -CustomRulePath by another door"),
+    ("tier2-repo-local-tmp", BLOCK, "bats ./tmp/tests",
+     "temp containment was by directory NAME, so a `tmp/` the repo itself controls satisfied every "
+     "Tier 2 row and the containment claim in the docs was false. Location, not name"),
+    ("tier2-repo-tmp-absolute", BLOCK, "bats C:/Users/example/SQA-loop/tmp/tests",
+     "the same hole spelled absolutely"),
+    ("redirect-repo-local-tmp", BLOCK, "echo x > ./tmp/out.txt",
+     "the redirect sink had the same name-not-location defect, so output could be written into "
+     "the repository the guard exists to protect"),
+    ("pester-output-takes-value", ALLOW,
+     "pwsh -NoProfile -NonInteractive -Command Invoke-Pester C:/Users/example/AppData/Local/Temp/a/tests -Output Detailed",
+     "OVER-REFUSAL, which is a real defect here: the row treated -Output as a switch, so its value "
+     "had nowhere to match. A guard that refuses legitimate work teaches agents to route around it"),
 ]
 
 # ------------------------------------------------------------------------------- THE GATE

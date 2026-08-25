@@ -115,6 +115,29 @@ for ($i = 0; $i -lt $cmd.Length; $i++) {
     $ch = $cmd[$i]
     $next = if ($i + 1 -lt $cmd.Length) { $cmd[$i + 1] } else { [char]0 }
 
+    # BACKSLASH ESCAPING. Outside single quotes, `\` makes the NEXT character literal, so `\"`
+    # neither opens nor closes a quoted region. Without this the tokeniser's quote parity desyncs
+    # from the shell's, and everything after the stray quote is treated as quoted: separators stop
+    # splitting and the redirect and denylist scans go blind.
+    #
+    # MEASURED, on the live guard, before this fix:
+    #   grep -rn "ab"   README.md ; cd /   -> BLOCK   (correct)
+    #   grep -rn "a\"b" README.md ; cd /   -> ALLOW   (one backslash, and `cd /` executed)
+    # It predates today's masking -- the original guard is bypassed identically -- but masking
+    # widened the blast radius, because the desynced region is now blanked as well as unsplit.
+    #
+    # BOTH characters are appended, so the text the allowlist matches is unchanged; the only
+    # effect is that the escaped character cannot act as a quote or a separator. That is also why
+    # an unquoted Windows path (`C:\Users\...`) is safe here: `\U` appends `\` then `U`.
+    # Single quotes are excluded because bash gives backslash no special meaning inside them.
+    if ($ch -eq '\' -and -not $sq -and $i + 1 -lt $cmd.Length) {
+        $escMask = ($segIsSearcher -and $dq)
+        Add-Char $ch $escMask
+        $i++
+        Add-Char $cmd[$i] $escMask
+        continue
+    }
+
     # Decide searcher-ness at the moment a quote OPENS, using the segment text seen so far. The
     # head always precedes the first quote in any real invocation (`grep -rn "..."`).
     if (($ch -eq "'" -and -not $dq) -or ($ch -eq '"' -and -not $sq)) {
@@ -135,8 +158,19 @@ for ($i = 0; $i -lt $cmd.Length; $i++) {
             Deny("command substitution is not permitted (found '$ch'). Its contents are a command in their own right; run the inner command on its own so it can be checked.")
         }
         # Comment: the rest of the LINE is not executed, so drop it (rule 2).
+        #
+        # THE NEWLINE THAT ENDS A COMMENT IS STILL A SEPARATOR, and forgetting that was a real
+        # bypass. The `while` below stops ON the newline, then `continue` hands control to the
+        # for-loop's own `$i++`, which steps PAST it -- so the newline was never processed as a
+        # separator and the two lines fused into ONE segment. A greedy allowlist row then absorbed
+        # the lot:
+        #     ls # note<LF>cd /   ->  segment `ls  cd /`  ->  matched `(?:ls|dir)\s*.*`  ->  ALLOW
+        # Measured on the live guard, and on the ORIGINAL guard too -- it predates today's work and
+        # the corpus never caught it because `evade-comment-suffix` and `evade-newline-chain` are
+        # separate cases that are never composed.
         if ($ch -eq '#') {
             while ($i -lt $cmd.Length -and $cmd[$i] -ne "`n") { $i++ }
+            if ($i -lt $cmd.Length) { Close-Segment $cmd[$i]; $segIsSearcher = $false }
             continue
         }
         # Every separator below ALSO ends the searcher context: the next segment gets its own head.
@@ -180,21 +214,37 @@ $maskedCmd = $maskedAll.ToString()
 # an un-normalised path is not a containment check -- `/tmp/../hooks/guard.ps1` starts with an
 # approved prefix and lands in the repo. That was a measured bypass against the redirect rule and
 # it would be the same bypass here.
-$tempArg = '(?:[A-Za-z]:)?[\\/]?(?:[^\s;|&]*[\\/])?(?:temp|tmp)[\\/][^\s;|&]*'
+# A REAL TEMP ROOT, not merely a directory called "tmp". The first version matched any path with
+# a `temp`/`tmp` SEGMENT anywhere in it, which `<repo>/tmp/evil.sh` satisfies -- so a Tier 2 tool
+# could be pointed at a directory the repo itself controls, and the containment claim in the docs
+# was false. Location, not name: an absolute `/tmp`, an absolute `<drive>:\Temp`, or the real
+# Windows per-user temp under `AppData\Local\Temp` (which also covers the WSL spelling
+# `/mnt/c/Users/<u>/AppData/Local/Temp/...`).
+$tempRoot = '(?:(?:[A-Za-z]:)?[\\/](?:temp|tmp)[\\/]' +
+            '|(?:[^\s;|&]*[\\/])?AppData[\\/]Local[\\/]Temp[\\/])'
+$tempArg = $tempRoot + '[^\s;|&]*'
 
 # The same shape, but tolerating the SINGLE QUOTES shlex.join adds. perf_probe derives the string
 # it shows this guard with shlex.join, which quotes any token containing a backslash -- and
 # Path.resolve() always produces backslashes on Windows. An unquoted-only pattern would refuse
 # every real `--lang ps1|sh` invocation. Stops at a quote or whitespace rather than at `;|&`,
 # because inside the quotes those are literal.
-$qTempPath = "'?(?:[A-Za-z]:)?[\\/](?:[^\s']*[\\/])?(?:temp|tmp)[\\/][^\s']*"
+# Same real-temp-root rule as $tempRoot above, but tolerating the single quotes shlex.join adds.
+$qTempPath = "'?(?:(?:[A-Za-z]:)?[\\/](?:temp|tmp)[\\/]" +
+             "|(?:[^\s']*[\\/])?AppData[\\/]Local[\\/]Temp[\\/])[^\s']*"
 
 # The PARAMETERS Invoke-ScriptAnalyzer may receive. A POSITIVE allowlist, and it has to be:
 # PowerShell binds any unambiguous parameter PREFIX, so `-F`, `-Fi` and `-Fix` all reach -Fix
 # (measured 2026-08-24; `-Zzz` is rejected, so the probe discriminates). A negative match on the
 # literal string `-Fix` is defeated by typing one fewer character. Anything starting with `-`
 # that is not on this list is refused.
-$psaParam = '-(?:Path|Settings|IncludeRule|ExcludeRule|Severity|Recurse|ReportSummary|IncludeDefaultRules|EnableExit)\b'
+# `-Settings` IS DELIBERATELY ABSENT. A PSSA settings .psd1 carries its own `CustomRulePath` key,
+# so `-Settings <any>.psd1` loads arbitrary rule modules and executes their top-level code -- it
+# defeats the pinned `-CustomRulePath` below by a completely different door. Since agents can write
+# into temp, an unpinned `-Settings` is the same arbitrary-code-execution hole with one more step.
+# The bundled settings file is applied by lint_probe.py internally, where the caller cannot reach
+# it, so nothing legitimate needs this parameter on the command line.
+$psaParam = '-(?:Path|IncludeRule|ExcludeRule|Severity|Recurse|ReportSummary|IncludeDefaultRules|EnableExit)\b'
 
 $gitOpts = '(?:-C\s+\S+\s+|-c\s+[\w.]+=\S+\s+|--git-dir=\S+\s+|--work-tree=\S+\s+|--no-pager\s+)*'
 $gitRead = 'status|diff|log|show|blame|describe|rev-parse|rev-list|ls-files|ls-tree|cat-file|shortlog|whatchanged|diff-tree|merge-base|symbolic-ref|count-objects|verify-pack|check-ignore|grep|for-each-ref'
@@ -319,7 +369,13 @@ $allowed = @(
     # suite protects, not over capability -- and that is the same accepted risk `pytest` and
     # `python foo.py` already carry two screens above, in new syntax rather than a new class.
     ("(?!.*\.\.)(?:wsl\s+(?:--\s+)?)?bats\b(?!.*(?:--output|--report-formatter|\s-o\b))(?:\s+--?[\w-]+(?:\s+\d+)?)*\s+" + $tempArg + '\s*'),
-    ("(?!.*\.\.)(?:powershell|pwsh)(?:\.exe)?\s+-NoProfile\s+-NonInteractive\s+-Command\s+Invoke-Pester(?:\s+-(?:Path|Output|CI|Detailed)\b)*\s+(?:-Path\s+)?" + $tempArg + '\s*'),
+    # `-Output` and `-Path` TAKE VALUES; `-CI` and `-Detailed` are switches. The first version
+    # treated all four as switches, so `-Output Detailed` was refused (the value `Detailed` had
+    # nowhere to match) and the row was order-sensitive into the bargain. An over-refusal is a real
+    # defect here, not a safe default: it is what teaches an agent to route around the guard.
+    ("(?!.*\.\.)(?:powershell|pwsh)(?:\.exe)?\s+-NoProfile\s+-NonInteractive\s+-Command\s+Invoke-Pester" +
+     "(?:\s+(?:-(?:Output|Path)\s+\S+|-(?:CI|Detailed|PassThru)\b))*" +
+     "(?:\s+(?:-Path\s+)?" + $tempArg + ")(?:\s+(?:-(?:Output|Path)\s+\S+|-(?:CI|Detailed|PassThru)\b))*\s*"),
 
     # --- STATIC ANALYSIS, Tier 1: Invoke-ScriptAnalyzer under a CLOSED PARAMETER GRAMMAR.
     #
@@ -358,7 +414,15 @@ $allowed = @(
 
     # --- HYPERFINE, under a closed grammar. See the long note at the foot of this file.
     ('(?!.*\.\.)hyperfine(?:\s+(?:(?:-w|--warmup|-m|--min-runs|-M|--max-runs|-r|--runs|-N|--style)\s+\S+|-i|--ignore-failure))*' +
-     '(?:\s+''(?:bash|sh|pwsh|powershell|python3?)\s+[^''"$`(){};|&<>*?]+''){1,2}\s*'),
+     # THE PAYLOAD IS A POSITIVE GRAMMAR, not "anything without metacharacters". v1 of this row
+     # allowed `[^'"$`(){};|&<>*?]+` after the interpreter name, which admits FLAGS -- and measured
+     # on the live guard, `hyperfine 'pwsh -Command <anything>'` and `hyperfine 'bash -c whoami'`
+     # both ALLOWED: arbitrary execution through the one row whose entire purpose was to stop
+     # exactly that. Same defect class as `-Fix` -- a character denylist cannot see that `-Command`
+     # is a channel. Payload flags are therefore allowlisted POSITIVELY and every other `-token`
+     # fails, which is what makes a novel flag fail for the same reason `-Command` does.
+     '(?:\s+''(?:bash|sh|pwsh|powershell|python3?)(?:\s+(?:-NoProfile|-NonInteractive|-File))*' +
+     '(?:\s+(?!-)[^''"$`(){};|&<>*?\s]+)+''){1,2}\s*'),
 
     # --- SANDBOX STAGING. `cp` returns to the allowlist for exactly one shape: copying INTO a
     # temp directory, which is how a Tier 2 sandbox gets built. The destination must be the FINAL
@@ -398,16 +462,33 @@ $allowed = @(
     '(?:Get-Content|Select-String|Get-ChildItem|Get-Item|Test-Path|Measure-Object|Get-Command|Get-Help|Compare-Object|ConvertFrom-Json|Select-Object|Where-Object|ForEach-Object|Sort-Object|Format-List|Format-Table|Out-String|Write-Output|Write-Host)\b.*'
 )
 
+# PER-PATTERN timeout, and an AGGREGATE deadline over the whole check.
+#
+# The per-pattern value alone made the file's own advertised bound false. There are ~60 allowlist
+# rows and ~12 denylist rows, each with its own 2 s ceiling, so total blocking time was bounded
+# only by (patterns x 2 s) -- and a hook runs in front of EVERY Bash call from six agents.
+# Measured before this fix: a 700-character command took 2054 ms and was ALLOWED, 1050 chars took
+# 4213 ms, 1400 chars took 2796 ms and fail-closed. "Evaluating this command took over 2s" was
+# simply not true of the thing being bounded.
 $MATCH_TIMEOUT = [TimeSpan]::FromSeconds(2)
+$TOTAL_BUDGET_MS = 5000
+$GUARD_CLOCK = [System.Diagnostics.Stopwatch]::StartNew()
+
+function Assert-Budget {
+    if ($GUARD_CLOCK.ElapsedMilliseconds -gt $TOTAL_BUDGET_MS) {
+        Deny("checking this command exceeded the guard's total time budget of ${TOTAL_BUDGET_MS}ms. It fails CLOSED: a command that cannot be checked in bounded time is not allowed through. This is usually a very long or deeply nested command -- split it into separate calls.")
+    }
+}
 
 function Matches-Any([string]$text, [string[]]$pats) {
     foreach ($p in $pats) {
+        Assert-Budget
         try {
             if ([regex]::IsMatch($text, '^\s*(?:' + $p + ')\s*$',
                                  [Text.RegularExpressions.RegexOptions]::IgnoreCase,
                                  $MATCH_TIMEOUT)) { return $true }
         } catch [Text.RegularExpressions.RegexMatchTimeoutException] {
-            Deny("evaluating this command took over 2s. It fails CLOSED: a command that cannot be checked in bounded time is not allowed through.")
+            Deny("evaluating one pattern against this command exceeded ${MATCH_TIMEOUT}. It fails CLOSED: a command that cannot be checked in bounded time is not allowed through.")
         }
     }
     return $false
@@ -425,7 +506,13 @@ $redirectRe = '(?<![<>])[0-9]?>{1,2}\s*(?!&)(?<target>[^\s;|&]+)|>\|\s*(?<target
 # A `..` ANYWHERE in the target disqualifies it, checked separately below. `/tmp/../SKILL.md`
 # starts with an approved prefix and lands in the repo root -- a measured bypass. Prefix
 # matching on an un-normalised path is not a containment check.
-$tempOk = '^(?:/dev/null|NUL|nul|\$null)$|^(?:[A-Za-z]:)?[\\/]?(?:.*[\\/])?(?:temp|tmp|Temp|TEMP)[\\/]'
+# Tightened 2026-08-24 to the same REAL-temp-root rule as $tempRoot, for the same reason: the old
+# form matched any path containing a `tmp` segment, so `<repo>/tmp/out.txt` counted as "somewhere
+# harmless" and a redirect could write into the repository the guard exists to protect. Location,
+# not name.
+$tempOk = '^(?:/dev/null|NUL|nul|\$null)$' +
+          '|^(?:[A-Za-z]:)?[\\/](?:temp|tmp|Temp|TEMP)[\\/]' +
+          '|^(?:.*[\\/])?AppData[\\/]Local[\\/]Temp[\\/]'
 
 for ($k = 0; $k -lt $segments.Count; $k++) {
     $seg = $segments[$k]
@@ -486,14 +573,26 @@ $denylist = @(
     # Also command-position anchored, for the same reason: `rg 'npm install' README.md` is a
     # legitimate search.
     ($CP + '(npm\s+(install|i|ci|publish)|yarn\s+add|pnpm\s+(add|install)|pip3?\s+install|python\s+-m\s+pip\s+install|cargo\s+install|apt(-get)?\s+install|yum\s+install|brew\s+install|choco\s+install|pio\s+pkg\s+install)\b'),
+    # THE SCANNING SPANS ARE BOUNDED AT {0,600}, NOT ATOMIC. Each interpreter-payload rule carries
+    # two unbounded scanning spans around a literal, which is the classic quadratic-backtracking
+    # shape and was measured as a real cost: a 700-character command took 2054 ms, 1050 chars
+    # 4213 ms. The obvious fix -- wrapping each span in an atomic group `(?>...)` -- was tried and
+    # is WRONG: an atomic greedy span consumes to end-of-string and can never give characters back,
+    # so `\s-(c|e|...)` after it can never match. Measured: it silently disabled NINE must-block
+    # cases at once (python-c-write, node-e-write, alias-shutil, dunder-import, getattr-indirect,
+    # exec-string, open-write-spaced, py-subprocess, evade-semicolon-interpreter) while the guard
+    # still looked healthy. A bound preserves the backtracking these rules genuinely need and caps
+    # the worst case at ~600^2 steps per rule; the aggregate deadline in Assert-Budget is the
+    # backstop for everything the bound does not cover.
+    #
     # THE GAP MUST ALLOW `;`. It used to be `[^|;&]*`, so a semicolon anywhere in the inline
     # program ended the match and the write was never seen:
     #   python -c "import os; os.remove('scripts/probe.py')"     -> allowed
     # A semicolon is ordinary punctuation INSIDE an interpreter payload, not a shell separator
     # -- the segment splitter has already handled real shell separators, and it is quote-aware,
-    # so by the time this runs a `;` here is part of the program. `[^|&]*` keeps the pipeline
+    # so by the time this runs a `;` here is part of the program. `[^|&]{0,600}` keeps the pipeline
     # and background guards while closing the class.
-    '\b(python3?|node|perl|ruby|php|deno|bun)\b[^|&]*\s-(c|e|r|-eval)\b[^|&]*(open\s*\([^)]*[''"][waxr]\+?[''"]|writeFile|write_text|\.write\s*\(|os\.remove|os\.unlink|os\.rename|os\.rmdir|shutil\.(copy|move|rmtree)|Path\s*\([^)]*\)\.(write|unlink|rename)|unlink\s*\(|mkdir|makedirs|fs\.(write|unlink|rename|rm))',
+    '\b(python3?|node|perl|ruby|php|deno|bun)\b[^|&]{0,600}\s-(c|e|r|-eval)\b[^|&]{0,600}(open\s*\([^)]*[''"][waxr]\+?[''"]|writeFile|write_text|\.write\s*\(|os\.remove|os\.unlink|os\.rename|os\.rmdir|shutil\.(copy|move|rmtree)|Path\s*\([^)]*\)\.(write|unlink|rename)|unlink\s*\(|mkdir|makedirs|fs\.(write|unlink|rename|rm))',
 
     # METAPROGRAMMING ESCAPES inside an inline program. Measured 2026-08-11 against the
     # allowlist candidate: three payloads walked past the literal-name rule above --
@@ -508,18 +607,18 @@ $denylist = @(
     # PowerShell then tries to cast the string to Int32 -- the script dies at runtime with
     # "Cannot convert value ... to type System.Int32", which the corpus reports as error(1) on
     # every case, allow and block alike. Measured on the first draft of this rule.
-    ('\b(python3?|node|perl|ruby|php|deno|bun)\b[^|&]*\s-(c|e|r|-eval)\b[^|&]*' +
+    ('\b(python3?|node|perl|ruby|php|deno|bun)\b[^|&]{0,600}\s-(c|e|r|-eval)\b[^|&]{0,600}' +
      '(__import__|importlib|\bgetattr\s*\(|\bsetattr\s*\(|\bexec\s*\(|\beval\s*\(' +
      '|\bcompile\s*\(|\bglobals\s*\(|Function\s*\(|require\s*\(\s*[''"]child_process)'),
 
     # An aliased import of a write-capable module. `import shutil as s` renames the namespace,
     # so every later reference is invisible to a literal-name rule.
-    ('\b(python3?|py)\b[^|&]*\s-c\b[^|&]*' +
+    ('\b(python3?|py)\b[^|&]{0,600}\s-c\b[^|&]{0,600}' +
      '(import\s+(os|shutil|subprocess|pathlib|tempfile)\s+as\s+\w+' +
      '|from\s+(os|shutil|subprocess|pathlib)\s+import)'),
 
     # Shelling out from inside the interpreter is a nested shell by another name.
-    ('\b(python3?|node|perl|ruby|php|deno|bun)\b[^|&]*\s-(c|e|r|-eval)\b[^|&]*' +
+    ('\b(python3?|node|perl|ruby|php|deno|bun)\b[^|&]{0,600}\s-(c|e|r|-eval)\b[^|&]{0,600}' +
      '(os\.system|os\.popen|os\.exec|subprocess|child_process|\bsystem\s*\()')
 )
 

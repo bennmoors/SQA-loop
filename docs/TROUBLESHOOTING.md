@@ -139,7 +139,7 @@ idempotent by design.
 
 ### "Gate 3 fails on a fresh install"
 
-Expected as of 2026-08-24: `scope_corpus` scores 47/51, with four known must-block failures in
+Expected as of 2026-08-24: `scope_corpus` scores 53/57, with four known must-block failures in
 `fixer-scope-guard.ps1`'s Bash branch. They are documented upstream bypasses, not an install fault
 — read [GUARDS.md § Known gaps](GUARDS.md#known-gaps) before relying on the fixer boundary. Gates 1
 and 2 should both be clean; if either is not, that *is* an install problem.

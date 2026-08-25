@@ -157,7 +157,7 @@ bug in the guard must never wedge a legitimate run.
 ### Corpus status
 
 ```
-must-block: 98/98     must-allow: 55/55     153/153 = 100.0%
+must-block: 113/113   must-allow: 63/63     176/176 = 100.0%
 ```
 
 Measured 2026-08-24 via `--invocation frontmatter`, i.e. through the same wiring production uses.
@@ -210,9 +210,40 @@ Deny rules in `settings.json` are global. Denying `Edit` on `qa-history/**` woul
 **main session**, which is required to write the ledger after the loop closes. The exclusion has to
 be scoped to the agent, and frontmatter hooks are the only per-agent mechanism.
 
+### What the first SQA round on these files found (2026-08-24)
+
+The suite was pointed at its own guards as soon as it could review PowerShell. **It found five
+bypasses while `guard_corpus` scored 162/162.** That number is the finding:
+
+| Bypass | Cause |
+|---|---|
+| `ls # note`⏎`cd /` | comment scan stopped **on** the newline and the loop then stepped past it, so two lines fused into one segment |
+| `grep -rn "a\"b" … ; cd /` | tokeniser ignored backslash escaping, desyncing quote parity from bash |
+| `hyperfine 'pwsh -Command …'` | payload grammar excluded metacharacters but admitted **flags** |
+| `grep … ; Set-Content <protected>` | the searcher exemption was anchored on the whole command |
+| `sc -Path <protected>`, `[IO.File]::WriteAllText(…)`, `-Pat:<path>` | literal name lists: aliases, .NET statics and parameter **prefixes** all walked past |
+
+Two of the five (comment-newline, backslash-quote) bypass the **original** guard too — they predate
+the shell/PowerShell work entirely. All five are fixed and each now has a corpus case.
+
+**Every evasion family was already in the corpus as a single case, and none was ever composed with
+another.** `evade-comment-suffix` and `evade-newline-chain` had both existed for weeks; putting them
+in one command defeated the guard. That is this file's own warning — *the score measured the
+author's imagination, not the guard* — arriving a second time, which is why the new cases are
+explicitly labelled `COMPOSED` and why a green corpus is not a safety proof.
+
+Two more results worth keeping:
+
+- **`lint_probe` returned `Critical=0` on both files.** Not one of the findings was visible to any
+  static backend. A clean PSScriptAnalyzer run is not a security result.
+- **The obvious fix for the backtracking was wrong.** Wrapping the payload spans in atomic groups
+  `(?>…)` silently disabled **nine** must-block cases, because an atomic greedy span consumes to
+  end-of-string and can never give characters back. Bounded `{0,600}` spans plus an aggregate
+  deadline are what shipped.
+
 ### Known gaps
 
-**The scope guard's corpus scores 47/51 (92.2%). Four must-block cases fail.** They are real
+**The scope guard's corpus scores 53/57 (93.0%). Four must-block cases fail.** They are real
 bypasses, present upstream, and not introduced by packaging — verified identical against both the
 authoring machine's live copy and this repository's copy on 2026-08-21.
 
@@ -268,7 +299,7 @@ python ~/.claude/qa-harness/adversarial_probe.py ~/.claude/hooks/sqa-guard-bash.
 >
 > **The four known scope-guard bypasses are outside `GATE_IDS`.** So
 > `scope_corpus.py --gate` exits 0 and prints "every case behaved as required" for a guard with
-> four real holes. Measured 2026-08-24: `--gate` → exit 0 · full run → exit 1, 47/51.
+> four real holes. Measured 2026-08-24: `--gate` → exit 0 · full run → exit 1, 53/57.
 > (`evade-set-content-ledger` moved INTO the gate on 2026-08-24, once it was green — a gate case
 > that is already red cannot detect a regression, which is why it sat outside while it failed.)
 >
