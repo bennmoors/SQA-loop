@@ -64,6 +64,35 @@ function Deny([string]$why) {
     exit 2
 }
 
+# ------------------------------------------------------------------ time budget
+#
+# THE CLOCK STARTS HERE, BEFORE ANY WORK, and that placement is the whole fix.
+#
+# v1 of this budget started the stopwatch just above the allowlist matcher and called
+# Assert-Budget from exactly ONE site, inside Matches-Any. The tokeniser ran before the clock
+# existed, and the redirect, here-doc and denylist scans never consulted it -- so the advertised
+# bound covered one of four phases. Measured worst case 7775 ms ending in ALLOW, with no refusal
+# emitted. An advertised bound that is false is worse than no bound, because it is quoted.
+#
+# WHY THIS MATTERS MORE THAN IT LOOKS. The denylist's interpreter-payload rules are genuinely
+# quadratic and are DELIBERATELY left unbounded (see the note at the denylist): bounding their
+# scanning spans re-opened a write channel at ~620 characters of padding, which is a far worse
+# defect than being slow. So this budget is now the ONLY thing bounding time, and it has to cover
+# every phase or it bounds nothing.
+#
+# It also removes a dependency on harness behaviour. Because the guard reaches its own budget and
+# calls Deny itself, it never matters whether a PreToolUse hook that TIMES OUT is treated as
+# blocking or non-blocking -- we exit 2 under our own power rather than hanging and finding out.
+$MATCH_TIMEOUT = [TimeSpan]::FromSeconds(2)
+$TOTAL_BUDGET_MS = 5000
+$GUARD_CLOCK = [System.Diagnostics.Stopwatch]::StartNew()
+
+function Assert-Budget {
+    if ($GUARD_CLOCK.ElapsedMilliseconds -gt $TOTAL_BUDGET_MS) {
+        Deny("checking this command exceeded the guard's total time budget of ${TOTAL_BUDGET_MS}ms. It fails CLOSED: a command that cannot be checked in bounded time is not allowed through. This is usually a very long or deeply nested command -- split it into separate calls.")
+    }
+}
+
 # ------------------------------------------------------------------ tokenise into segments
 # Quote-aware: separators inside quotes are literal. `grep -rn 'a; b' .` is ONE segment, and
 # treating that semicolon as a separator would refuse a legitimate search.
@@ -112,6 +141,7 @@ function Close-Segment([char]$sep) {
 }
 
 for ($i = 0; $i -lt $cmd.Length; $i++) {
+    if (($i -band 1023) -eq 0) { Assert-Budget }
     $ch = $cmd[$i]
     $next = if ($i + 1 -lt $cmd.Length) { $cmd[$i + 1] } else { [char]0 }
 
@@ -168,8 +198,27 @@ for ($i = 0; $i -lt $cmd.Length; $i++) {
         # Measured on the live guard, and on the ORIGINAL guard too -- it predates today's work and
         # the corpus never caught it because `evade-comment-suffix` and `evade-newline-chain` are
         # separate cases that are never composed.
-        if ($ch -eq '#') {
+        # A `#` STARTS A COMMENT ONLY AT A WORD BOUNDARY. That is bash's actual rule, and getting
+        # it wrong was a total allowlist bypass rather than a refinement:
+        #     echo AAA#; echo BBB
+        # bash sees `AAA#` as one ordinary word and runs BOTH commands. The guard treated the `#`
+        # as a comment, discarded everything after it, and judged only `echo AAA`. Reproduced live
+        # through a guarded Bash tool -- both lines printed while the guard had approved one.
+        # Pre-existing, and invisible to the corpus because every `#` case put a space in front.
+        #
+        # The boundary is: start of input, or preceded by whitespace, or preceded by a separator
+        # (the previous character having been consumed as one). `$prevCh` is 0 at start of input,
+        # which is why the test reads as "not a word character before it".
+        $prevCh = if ($i -gt 0) { $cmd[$i - 1] } else { [char]0 }
+        $atWordStart = ($i -eq 0) -or ($prevCh -eq [char]0) -or
+                       [char]::IsWhiteSpace($prevCh) -or
+                       ($prevCh -eq ';') -or ($prevCh -eq '|') -or ($prevCh -eq '&')
+        if ($ch -eq '#' -and $atWordStart) {
             while ($i -lt $cmd.Length -and $cmd[$i] -ne "`n") { $i++ }
+            # THE NEWLINE THAT ENDS A COMMENT IS STILL A SEPARATOR. The loop above stops ON it and
+            # `continue` hands control to the for-loop's own `$i++`, which steps PAST it -- so
+            # without this the two lines fused into ONE segment and a greedy row absorbed the lot
+            # (`ls # note<LF>cd /` -> ALLOW, measured on the original guard too).
             if ($i -lt $cmd.Length) { Close-Segment $cmd[$i]; $segIsSearcher = $false }
             continue
         }
@@ -232,6 +281,23 @@ $tempArg = $tempRoot + '[^\s;|&]*'
 # Same real-temp-root rule as $tempRoot above, but tolerating the single quotes shlex.join adds.
 $qTempPath = "'?(?:(?:[A-Za-z]:)?[\\/](?:temp|tmp)[\\/]" +
              "|(?:[^\s']*[\\/])?AppData[\\/]Local[\\/]Temp[\\/])[^\s']*"
+
+# THE HYPERFINE PAYLOAD FRAGMENTS, named once because the row needs the same two shapes in two
+# places -- before the benchmarked target and after it. v3 wrote them out inline and only in the
+# leading position, which is exactly why a flag AFTER the target was refused:
+#     hyperfine 'python3 <temp>/bench.py --size 10'   -> BLOCK, and it should not be
+# Two copies of a lookahead are two places to forget one, so they are variables.
+#   $hfCh   one payload character: no quote, no shell metacharacter, no glob
+#   $hfFlag a flag that is NOT a code channel. `-c`, `-e`, `-ec`, `-Command`, `-EncodedCommand`
+#           and `--eval` all mean "the next token is a program", which is the hole this row
+#           exists to close; every other flag is an ordinary argument to a staged script.
+#   $hfTemp the benchmarked target, which must live under a real temp root (Tier 2: hyperfine
+#           EXECUTES its payload, so it never runs the live repo or the installed ~/.claude copy).
+$hfCh   = '[^''"$`(){};|&<>*?\s]'
+$hfWord = $hfCh + '+'
+$hfFlag = '(?!-(?:c|e|ec|Command|EncodedCommand|-eval)\b)-[\w-]+'
+$hfTemp = '(?:(?:[A-Za-z]:)?[\\/](?:temp|tmp)[\\/]' +
+          '|(?:' + $hfCh + '*[\\/])?AppData[\\/]Local[\\/]Temp[\\/])' + $hfCh + '*'
 
 # The PARAMETERS Invoke-ScriptAnalyzer may receive. A POSITIVE allowlist, and it has to be:
 # PowerShell binds any unambiguous parameter PREFIX, so `-F`, `-Fi` and `-Fix` all reach -Fix
@@ -374,8 +440,14 @@ $allowed = @(
     # nowhere to match) and the row was order-sensitive into the bargain. An over-refusal is a real
     # defect here, not a safe default: it is what teaches an agent to route around the guard.
     ("(?!.*\.\.)(?:powershell|pwsh)(?:\.exe)?\s+-NoProfile\s+-NonInteractive\s+-Command\s+Invoke-Pester" +
-     "(?:\s+(?:-(?:Output|Path)\s+\S+|-(?:CI|Detailed|PassThru)\b))*" +
-     "(?:\s+(?:-Path\s+)?" + $tempArg + ")(?:\s+(?:-(?:Output|Path)\s+\S+|-(?:CI|Detailed|PassThru)\b))*\s*"),
+     # EVERY PATH TOKEN MUST BE IN TEMP, including one supplied through the option group. v2 wrote
+     # `-(?:Output|Path)\s+\S+` there, which accepted an arbitrary path, so
+     # `Invoke-Pester <temp>/tests -Path C:/Users/moors/.claude/hooks` satisfied the row -- the
+     # containment this row's own comment claims was gone. `-Output` takes a word (Detailed,
+     # Normal, None), never a path, so it is typed separately rather than sharing an alternation.
+     "(?:\s+(?:-Output\s+\w+|-Path\s+" + $tempArg + "|-(?:CI|Detailed|PassThru)\b))*" +
+     "(?:\s+(?:-Path\s+)?" + $tempArg + ")" +
+     "(?:\s+(?:-Output\s+\w+|-Path\s+" + $tempArg + "|-(?:CI|Detailed|PassThru)\b))*\s*"),
 
     # --- STATIC ANALYSIS, Tier 1: Invoke-ScriptAnalyzer under a CLOSED PARAMETER GRAMMAR.
     #
@@ -419,10 +491,32 @@ $allowed = @(
      # on the live guard, `hyperfine 'pwsh -Command <anything>'` and `hyperfine 'bash -c whoami'`
      # both ALLOWED: arbitrary execution through the one row whose entire purpose was to stop
      # exactly that. Same defect class as `-Fix` -- a character denylist cannot see that `-Command`
-     # is a channel. Payload flags are therefore allowlisted POSITIVELY and every other `-token`
-     # fails, which is what makes a novel flag fail for the same reason `-Command` does.
-     '(?:\s+''(?:bash|sh|pwsh|powershell|python3?)(?:\s+(?:-NoProfile|-NonInteractive|-File))*' +
-     '(?:\s+(?!-)[^''"$`(){};|&<>*?\s]+)+''){1,2}\s*'),
+     # is a channel.
+     #
+     # TWO CORRECTIONS from the round-2 review, which found v2 wrong in BOTH directions:
+     #   * It admitted `-File` and a bare positional with NO temp constraint, so
+     #     `hyperfine 'pwsh -File C:/Users/moors/evil.ps1'` ran a script from anywhere -- while
+     #     every sibling Tier 2 row requires a staged copy. hyperfine EXECUTES its payload, so it
+     #     is Tier 2 and the target must be in temp like bats and Invoke-Pester.
+     #   * Its `(?!-)` rejected EVERY flag, not just channel flags, so
+     #     `hyperfine 'python3 bench.py --size 10'` went ALLOW -> BLOCK. An over-refusal on
+     #     sqa-efficiency's own instrument is a real defect, not a safe default.
+     # The resolution is to refuse the CHANNEL set by name and allow other flags, while requiring
+     # the target to be a temp path. `--size 10` on a staged script is now expressible; inline code
+     # and running from outside the sandbox are not.
+     #
+     # A THIRD CORRECTION, round 3: the trailing group was `(?:\s+(?!-)WORD)*`, which admits a
+     # positional argument after the target but NO FLAG AT ALL -- so the very shape the second
+     # correction set out to allow was still refused whenever the flag followed the script rather
+     # than preceded it, which is where a script's own options actually go:
+     #     hyperfine 'python3 <temp>/bench.py --size 10'   -> BLOCK   (measured)
+     # Both positions now take $hfFlag, so a benign flag works either side of the target and a
+     # channel flag is refused on both -- one lookahead, named once, rather than two spellings of
+     # the rule that can drift apart.
+     '(?:\s+''(?:bash|sh|pwsh|powershell|python3?)' +
+     '(?:\s+' + $hfFlag + '(?:\s+(?!-)' + $hfWord + ')?)*' +
+     '\s+' + $hfTemp +
+     '(?:\s+(?:' + $hfFlag + '|(?!-)' + $hfWord + '))*''){1,2}\s*'),
 
     # --- SANDBOX STAGING. `cp` returns to the allowlist for exactly one shape: copying INTO a
     # temp directory, which is how a Tier 2 sandbox gets built. The destination must be the FINAL
@@ -462,24 +556,6 @@ $allowed = @(
     '(?:Get-Content|Select-String|Get-ChildItem|Get-Item|Test-Path|Measure-Object|Get-Command|Get-Help|Compare-Object|ConvertFrom-Json|Select-Object|Where-Object|ForEach-Object|Sort-Object|Format-List|Format-Table|Out-String|Write-Output|Write-Host)\b.*'
 )
 
-# PER-PATTERN timeout, and an AGGREGATE deadline over the whole check.
-#
-# The per-pattern value alone made the file's own advertised bound false. There are ~60 allowlist
-# rows and ~12 denylist rows, each with its own 2 s ceiling, so total blocking time was bounded
-# only by (patterns x 2 s) -- and a hook runs in front of EVERY Bash call from six agents.
-# Measured before this fix: a 700-character command took 2054 ms and was ALLOWED, 1050 chars took
-# 4213 ms, 1400 chars took 2796 ms and fail-closed. "Evaluating this command took over 2s" was
-# simply not true of the thing being bounded.
-$MATCH_TIMEOUT = [TimeSpan]::FromSeconds(2)
-$TOTAL_BUDGET_MS = 5000
-$GUARD_CLOCK = [System.Diagnostics.Stopwatch]::StartNew()
-
-function Assert-Budget {
-    if ($GUARD_CLOCK.ElapsedMilliseconds -gt $TOTAL_BUDGET_MS) {
-        Deny("checking this command exceeded the guard's total time budget of ${TOTAL_BUDGET_MS}ms. It fails CLOSED: a command that cannot be checked in bounded time is not allowed through. This is usually a very long or deeply nested command -- split it into separate calls.")
-    }
-}
-
 function Matches-Any([string]$text, [string[]]$pats) {
     foreach ($p in $pats) {
         Assert-Budget
@@ -515,6 +591,7 @@ $tempOk = '^(?:/dev/null|NUL|nul|\$null)$' +
           '|^(?:.*[\\/])?AppData[\\/]Local[\\/]Temp[\\/]'
 
 for ($k = 0; $k -lt $segments.Count; $k++) {
+    Assert-Budget
     $seg = $segments[$k]
     if ([string]::IsNullOrWhiteSpace($seg)) { continue }
     $s = $seg.Trim()
@@ -590,9 +667,9 @@ $denylist = @(
     #   python -c "import os; os.remove('scripts/probe.py')"     -> allowed
     # A semicolon is ordinary punctuation INSIDE an interpreter payload, not a shell separator
     # -- the segment splitter has already handled real shell separators, and it is quote-aware,
-    # so by the time this runs a `;` here is part of the program. `[^|&]{0,600}` keeps the pipeline
+    # so by the time this runs a `;` here is part of the program. `[^|&]*` keeps the pipeline
     # and background guards while closing the class.
-    '\b(python3?|node|perl|ruby|php|deno|bun)\b[^|&]{0,600}\s-(c|e|r|-eval)\b[^|&]{0,600}(open\s*\([^)]*[''"][waxr]\+?[''"]|writeFile|write_text|\.write\s*\(|os\.remove|os\.unlink|os\.rename|os\.rmdir|shutil\.(copy|move|rmtree)|Path\s*\([^)]*\)\.(write|unlink|rename)|unlink\s*\(|mkdir|makedirs|fs\.(write|unlink|rename|rm))',
+    '\b(python3?|node|perl|ruby|php|deno|bun)\b[^|&]*\s-(c|e|r|-eval)\b[^|&]*(open\s*\([^)]*[''"][waxr]\+?[''"]|writeFile|write_text|\.write\s*\(|os\.remove|os\.unlink|os\.rename|os\.rmdir|shutil\.(copy|move|rmtree)|Path\s*\([^)]*\)\.(write|unlink|rename)|unlink\s*\(|mkdir|makedirs|fs\.(write|unlink|rename|rm))',
 
     # METAPROGRAMMING ESCAPES inside an inline program. Measured 2026-08-11 against the
     # allowlist candidate: three payloads walked past the literal-name rule above --
@@ -607,18 +684,18 @@ $denylist = @(
     # PowerShell then tries to cast the string to Int32 -- the script dies at runtime with
     # "Cannot convert value ... to type System.Int32", which the corpus reports as error(1) on
     # every case, allow and block alike. Measured on the first draft of this rule.
-    ('\b(python3?|node|perl|ruby|php|deno|bun)\b[^|&]{0,600}\s-(c|e|r|-eval)\b[^|&]{0,600}' +
+    ('\b(python3?|node|perl|ruby|php|deno|bun)\b[^|&]*\s-(c|e|r|-eval)\b[^|&]*' +
      '(__import__|importlib|\bgetattr\s*\(|\bsetattr\s*\(|\bexec\s*\(|\beval\s*\(' +
      '|\bcompile\s*\(|\bglobals\s*\(|Function\s*\(|require\s*\(\s*[''"]child_process)'),
 
     # An aliased import of a write-capable module. `import shutil as s` renames the namespace,
     # so every later reference is invisible to a literal-name rule.
-    ('\b(python3?|py)\b[^|&]{0,600}\s-c\b[^|&]{0,600}' +
+    ('\b(python3?|py)\b[^|&]*\s-c\b[^|&]*' +
      '(import\s+(os|shutil|subprocess|pathlib|tempfile)\s+as\s+\w+' +
      '|from\s+(os|shutil|subprocess|pathlib)\s+import)'),
 
     # Shelling out from inside the interpreter is a nested shell by another name.
-    ('\b(python3?|node|perl|ruby|php|deno|bun)\b[^|&]{0,600}\s-(c|e|r|-eval)\b[^|&]{0,600}' +
+    ('\b(python3?|node|perl|ruby|php|deno|bun)\b[^|&]*\s-(c|e|r|-eval)\b[^|&]*' +
      '(os\.system|os\.popen|os\.exec|subprocess|child_process|\bsystem\s*\()')
 )
 
@@ -627,6 +704,7 @@ $denylist = @(
 # untouched -- and would already have died at the allowlist, since the segment splitter gives it
 # its own segment whose head no row admits.
 foreach ($p in $denylist) {
+    Assert-Budget
     try {
         $hit = [regex]::IsMatch($maskedCmd, $p,
                                 [Text.RegularExpressions.RegexOptions]::IgnoreCase, $MATCH_TIMEOUT)
