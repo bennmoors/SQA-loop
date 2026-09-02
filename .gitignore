@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+
+# PowerShell module cache, created if a run sets HOME into the repo
+Microsoft/

@@ -1,0 +1,46 @@
+{
+  "_comment": [
+    "Bash permission allowlist for the SQA-loop suite. Merge the `permissions.allow` array",
+    "below into your ~/.claude/settings.json, or run `.\\install.ps1 -MergeSettings` to have",
+    "it merged for you (it backs up settings.json first).",
+    "",
+    "THESE ARE A CONVENIENCE, NOT A SECURITY BOUNDARY. Skipping them costs you approval",
+    "prompts, nothing else -- the specialists still work. The actual boundary is the pair of",
+    "PreToolUse guards in ~/.claude/hooks/, which are an allowlist (the SQA specialists) and a",
+    "protected-path scope guard (the fixer). Do not confuse the two: settings.json entries say",
+    "'do not ask me about this', the hooks say 'this may not happen at all'.",
+    "",
+    "Prefix matching: `Bash(git status*)` matches any command starting `git status`. The",
+    "trailing `*` matters. Paths use `~`, which Claude Code expands per-user.",
+    "",
+    "Every entry here is read-only or test-running. Nothing in this list mutates a repository."
+  ],
+  "permissions": {
+    "allow": [
+      "Bash(git status*)",
+      "Bash(git diff*)",
+      "Bash(git log*)",
+      "Bash(git show*)",
+
+      "Bash(python -m unittest*)",
+      "Bash(python -m pytest*)",
+      "Bash(python -m py_compile*)",
+      "Bash(pytest*)",
+
+      "Bash(python ~/.claude/tools/perf_probe.py*)",
+
+      "Bash(python ~/.claude/qa-harness/agent_invariants.py*)",
+      "Bash(python ~/.claude/qa-harness/skill_invariants.py*)",
+      "Bash(python ~/.claude/qa-harness/mutate.py*)",
+      "Bash(python ~/.claude/qa-harness/guard_corpus.py*)",
+      "Bash(python ~/.claude/qa-harness/scope_corpus.py*)",
+      "Bash(python ~/.claude/qa-harness/adversarial_probe.py*)",
+
+      "Bash(python -m cosmic_ray.cli*)",
+
+      "Bash(pip list*)",
+      "Bash(pip show*)",
+      "Bash(pip-audit*)"
+    ]
+  }
+}
